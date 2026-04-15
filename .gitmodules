@@ -1,0 +1,3 @@
+[submodule "lib/shannon-prime"]
+	path = lib/shannon-prime
+	url = https://github.com/nihilistau/shannon-prime.git
