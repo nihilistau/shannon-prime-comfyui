@@ -50,5 +50,3 @@ See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the full guide with Wan archi
 ## License
 
 AGPLv3 / Commercial dual license. See [LICENSE](LICENSE).
-
-Copyright (C) 2026 Ray Daniels. Contact: raydaniels@gmail.com
