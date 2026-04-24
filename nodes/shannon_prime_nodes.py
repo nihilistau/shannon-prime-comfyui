@@ -126,6 +126,47 @@ class VHT2BlockSkipCache:
     def pop(self, block_idx, default=None):
         return self._cache.pop(block_idx, default)
 
+    def compare_spectral(self, block_idx, y_new):
+        """
+        Compute cos_sim between cached (compressed) y and new y WITHOUT
+        decompressing the cache to spatial domain.
+
+        VHT2 is orthogonal and self-inverse, so:
+            cos_sim(y_new, y_cached) == cos_sim(VHT2(y_new), VHT2(y_cached))
+
+        The Möbius reorder is just a permutation (orthogonal), so:
+            cos_sim(Möbius(VHT2(y_new)), Möbius(VHT2(y_cached))) == cos_sim(y_new, y_cached)
+
+        We dequantize the stored coefficients on CPU (cheap: just scale+add)
+        and compare against the new y's spectral coefficients, also on CPU.
+        This eliminates the full GPU decompress round-trip that caused the
+        doubling bug in the Mertens Oracle.
+
+        Returns float cos_sim in [0, 1].
+        """
+        if block_idx not in self._cache:
+            return 1.0
+
+        scales, quants, orig_shape, orig_dtype = self._cache[block_idx]
+
+        # Forward-transform y_new into the same spectral domain (on GPU, fast)
+        y_flat = y_new.reshape(-1, self.head_dim).float()
+        y_flat = _vht2(y_flat)
+        if self.mobius is not None:
+            y_flat = self.mobius.reorder(y_flat)
+
+        # Move new spectral coefficients to CPU (one transfer, ~11MB not ~98MB)
+        y_spec_cpu = y_flat.detach().cpu().reshape(-1)
+        del y_flat
+
+        # Dequantize cached coefficients on CPU (no GPU memory needed)
+        cached_flat = self.quantizer.dequantize(scales, quants).reshape(-1)
+
+        # CPU cos_sim — fast enough for a 50M-element vector (~50ms)
+        dot = (y_spec_cpu * cached_flat).sum()
+        norms = (y_spec_cpu.norm() * cached_flat.norm()).clamp_(min=1e-10)
+        return float((dot / norms).item())
+
     def __contains__(self, block_idx):
         return block_idx in self._cache
 
@@ -820,6 +861,7 @@ class ShannonPrimeWanBlockSkip:
             'last_gen_step':  [0],      # detect new generation (step reset)
             'last_e_mag':     [None],   # timestep-embedding magnitude at last block-0 call
             'last_block0_t':  [0.0],    # wall-clock time of last block-0 call (generation detector)
+            'step_duration':  [0.0],    # observed wall-clock per-step (adaptive t_gap baseline)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
             'attn_cache':     {},       # block_idx -> y tensor (CPU) or VHT2BlockSkipCache
             'step_cached':    {},       # block_idx -> step at which y was cached
@@ -897,23 +939,39 @@ class ShannonPrimeWanBlockSkip:
                     gap_reason = ""
                     # PRIMARY: e-magnitude monotonicity.
                     # Within any single Wan generation the timestep embedding
-                    # magnitude (e_mag) is strictly decreasing with sigma. Any
-                    # increase — even 1-2% — means sigma has reset → new generation.
-                    # This fires reliably regardless of step timing or how quickly
-                    # the user queues the next run, making it the principal detector.
-                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 1.02:
+                    # magnitude (e_mag) is strictly decreasing with sigma. A
+                    # large increase means sigma has reset → new generation.
+                    # Use 50% increase threshold: in SVI 6-step schedules,
+                    # e_mag can fluctuate ±5-10% between adjacent steps within
+                    # the same pass, but a true sigma reset jumps ~2-5×.
+                    # Previous 2% threshold caused false positives every step.
+                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 1.50:
                         is_new_gen = True
                         gap_reason = f"e-increase({last_em:.3f}->{e_mag:.3f})"
-                    # SECONDARY: wall-clock gap — catches the very first run after
-                    # a long idle (where last_em is None or stale) and edge cases
-                    # where the scheduler holds sigma steady for multiple steps.
-                    if state['last_block0_t'][0] > 0 and t_gap > 60.0:
+                    # SECONDARY: adaptive wall-clock gap — catches the very
+                    # first run after a long idle (where last_em is None).
+                    # Threshold is max(5× observed step duration, 300s) so it
+                    # works on slow cards (2060: ~85s/step) without false
+                    # positives. 5× gives ample margin: back-to-back steps
+                    # have t_gap ≈ 1× step_duration; between generations the
+                    # gap includes VAE decode + model reload + user idle time.
+                    step_dur = state['step_duration'][0]
+                    gap_thresh = max(step_dur * 5.0, 300.0) if step_dur > 0 else 300.0
+                    if state['last_block0_t'][0] > 0 and t_gap > gap_thresh:
                         is_new_gen = True
-                        gap_reason += f" t_gap={t_gap:.1f}s"
+                        gap_reason += f" t_gap={t_gap:.1f}s>{gap_thresh:.0f}s"
                     # TERTIARY: step-counter anomalies
                     if stale > 0 or (step <= 2 and last > 5):
                         is_new_gen = True
                         gap_reason += f" stale={stale}"
+
+                    # Track observed step duration for adaptive threshold
+                    if state['last_block0_t'][0] > 0 and not is_new_gen:
+                        # Exponential moving average of step duration
+                        if step_dur > 0:
+                            state['step_duration'][0] = step_dur * 0.7 + t_gap * 0.3
+                        else:
+                            state['step_duration'][0] = t_gap
 
                     if is_new_gen:
                         if verbose:
@@ -1066,16 +1124,30 @@ class ShannonPrimeWanBlockSkip:
                     )
 
                     # ── Mertens Oracle: update rolling cos_sim ─────────────────
+                    # CRITICAL: cos_sim must NOT allocate GPU memory for the
+                    # comparison. The old path did vht2_cache.get() (full GPU
+                    # decompress) or .to(device=cuda) (98MB CPU→GPU transfer)
+                    # per block per miss, fragmenting the CUDA allocator and
+                    # causing step times to double each iteration.
+                    #
+                    # Fix: VHT2 mode uses compare_spectral() — dequantize on
+                    # CPU, compare in spectral domain (cos_sim is invariant
+                    # under orthogonal transforms). Raw mode computes cos_sim
+                    # entirely on CPU. Zero GPU memory allocated.
                     _has_prev = (vht2_cache.has(block_idx) if vht2_cache is not None
                                  else block_idx in state['attn_cache'])
                     if _has_prev and eff_win > 0:
                         if vht2_cache is not None:
-                            y_prev = vht2_cache.get(block_idx, y.device, y.dtype)
+                            # Spectral cos_sim: no GPU decompress needed
+                            sim = vht2_cache.compare_spectral(block_idx, y)
                         else:
-                            y_prev = state['attn_cache'][block_idx].to(
-                                device=y.device, dtype=y.dtype)
-                        sim = _cos_sim(y, y_prev)
-                        del y_prev
+                            # CPU cos_sim: no GPU allocation needed
+                            y_cpu = y.detach().float().cpu().reshape(-1)
+                            y_prev_flat = state['attn_cache'][block_idx].float().reshape(-1)
+                            dot = (y_cpu * y_prev_flat).sum()
+                            norms = (y_cpu.norm() * y_prev_flat.norm()).clamp_(min=1e-10)
+                            sim = float((dot / norms).item())
+                            del y_cpu, y_prev_flat
                         # Exponential moving average
                         state['rolling_sim'][block_idx] = (
                             0.7 * state['rolling_sim'].get(block_idx, 1.0)
