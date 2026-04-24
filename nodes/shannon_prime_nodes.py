@@ -946,11 +946,9 @@ class ShannonPrimeWanBlockSkip:
                 return tier_1_window
             return 0
 
-        # Max consecutive hits before forcing a miss to update the oracle.
-        # The rolling oracle only updates on misses — without a forced miss, a
-        # streak of perfect hits masks a sudden y-drift (seen as warping at step 10).
-        # Default 5: force a miss every 5 hits regardless of window.
-        max_streak = 5  # hardcoded; could be a parameter if needed
+        # Adaptive streak limit — computed per-block per-step from rolling_sim.
+        # See the streak_forced_miss block below for the full tiered logic.
+        # (max_streak is no longer a fixed constant; it adapts to oracle confidence)
 
         # Shared state across all patched blocks
         state = {
@@ -1108,17 +1106,32 @@ class ShannonPrimeWanBlockSkip:
                                   f" -> forced miss, win halved to "
                                   f"{state['effective_win'][block_idx]}")
 
-                # Force a miss after max_streak consecutive hits so the oracle
-                # can observe the current y and update rolling_sim.
-                # Without this, a perfect-sim hit streak masks a sudden y-drift.
+                # Adaptive streak: force a miss after max_streak consecutive hits
+                # so the oracle can observe fresh y and update rolling_sim.
+                # Streak limit adapts to the oracle's own rolling_sim:
+                #   rolling_sim > 0.95  (proven Granite) → allow up to 10 hits
+                #   rolling_sim > 0.90  (stable)         → allow up to 7 hits
+                #   rolling_sim > 0.85  (drifting)       → allow up to 5 hits  (default)
+                #   rolling_sim ≤ 0.85  (volatile)       → allow only 3 hits
+                # This is self-calibrating: no sigma knowledge required.
+                _rsim = state['rolling_sim'].get(block_idx, 1.0)
+                if _rsim > 0.95:
+                    _adaptive_streak = 10
+                elif _rsim > 0.90:
+                    _adaptive_streak = 7
+                elif _rsim > 0.85:
+                    _adaptive_streak = 5
+                else:
+                    _adaptive_streak = 3
                 streak = state['hit_streak'].get(block_idx, 0)
-                streak_forced_miss = (eff_win > 0 and streak >= max_streak
+                streak_forced_miss = (eff_win > 0 and streak >= _adaptive_streak
                                       and block_idx in state['attn_cache'])
                 if streak_forced_miss:
                     state['hit_streak'][block_idx] = 0   # reset counter
                     if verbose:
                         print(f"[SP BlockSkip] B{block_idx:02d} STREAK-MISS "
-                              f"step={step} streak={streak}>={max_streak} -> oracle refresh")
+                              f"step={step} streak={streak}>={_adaptive_streak} "
+                              f"(sim={_rsim:.3f}) -> oracle refresh")
 
                 # Shape validation: cached y must match current x token count.
                 # Mismatch = stale cache from a different resolution or prompt
@@ -1241,7 +1254,7 @@ class ShannonPrimeWanBlockSkip:
             print(f"[SP BlockSkip] ── Run settings ──────────────────────────────────────────")
             print(f"[SP BlockSkip]   blocks={n_blocks}  tier0_win={tier_0_window}  tier1_win={tier_1_window}")
             print(f"[SP BlockSkip]   drift_thr={drift_threshold}  x_drift_t0={x_drift_t0}  x_drift_t1={x_drift_t1}")
-            print(f"[SP BlockSkip]   verbose={verbose}  max_streak=5  (hardcoded)")
+            print(f"[SP BlockSkip]   verbose={verbose}  streak=adaptive(sim>0.95→10, >0.90→7, >0.85→5, else→3)")
         except Exception:
             pass
         print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
