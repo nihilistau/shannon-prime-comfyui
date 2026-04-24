@@ -122,7 +122,7 @@
       ],
       "properties": {},
       "widgets_values": [
-        "wan2.2_vae.safetensors"
+        "wan_2.1_vae.safetensors"
       ]
     },
     {
