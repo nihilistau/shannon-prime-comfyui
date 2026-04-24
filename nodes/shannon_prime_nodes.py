@@ -1004,8 +1004,10 @@ class ShannonPrimeWanBlockSkip:
 
                     is_new_gen = False
                     gap_reason = ""
-                    # Primary: wall-clock gap (catches ALL generation boundaries)
-                    if state['last_block0_t'][0] > 0 and t_gap > 5.0:
+                    # Primary: wall-clock gap (catches ALL generation boundaries).
+                    # 60s gives safe margin even at 50s/it. The inter-step gap is
+                    # always << 60s; the inter-generation gap (VAE + idle) is >> 60s.
+                    if state['last_block0_t'][0] > 0 and t_gap > 60.0:
                         is_new_gen = True
                         gap_reason = f"t_gap={t_gap:.1f}s"
                     # Secondary: e-magnitude spike upward (sigma reset to max)
@@ -1512,10 +1514,15 @@ class ShannonPrimeWanRicciSentinel:
         def _print_log(log):
             if not log:
                 return
-            print(f"\n[SP Ricci Sentinel] Generation summary ({len(log)} steps):")
-            print(f"  {'Step':>4s}  {'e_mag':>7s}  {'regime':6s}  "
-                  f"{'win[0]':>6s}  {'win[4]':>6s}  {'roll_sim[0]':>11s}")
-            print("  " + "-" * 54)
+            try:
+                import tqdm as _tqdm
+                _w = _tqdm.tqdm.write
+            except Exception:
+                _w = print
+            _w(f"\n[SP Ricci Sentinel] Generation summary ({len(log)} steps):")
+            _w(f"  {'Step':>4s}  {'e_mag':>7s}  {'regime':6s}  "
+               f"{'win[0]':>6s}  {'win[4]':>6s}  {'roll_sim[0]':>11s}")
+            _w("  " + "-" * 54)
             last_regime = None
             switch_step = None
             for rec in log:
@@ -1523,17 +1530,17 @@ class ShannonPrimeWanRicciSentinel:
                 if last_regime is not None and regime != last_regime:
                     switch_step = rec['step']
                     arrow = "HIGH->LOW" if last_regime == "HIGH" else "LOW->HIGH"
-                    print(f"  {'':4s}  {'--- ' + arrow + ' ---':>40s}")
+                    _w(f"  {'':4s}  {'--- ' + arrow + ' ---':>40s}")
                 rs0 = f"{rec['roll_sim0']:.3f}" if rec['roll_sim0'] is not None else "   n/a"
-                print(f"  {rec['step']:4d}  {rec['e_mag']:7.3f}  {regime:6s}  "
-                      f"{rec['win0']:6d}  {rec['win4']:6d}  {rs0:>11s}")
+                _w(f"  {rec['step']:4d}  {rec['e_mag']:7.3f}  {regime:6s}  "
+                   f"{rec['win0']:6d}  {rec['win4']:6d}  {rs0:>11s}")
                 last_regime = regime
             if switch_step is not None:
-                print(f"\n  Regime switch at step {switch_step} "
-                      f"(split@{sentinel['split']:.0%} of e_mag range)")
+                _w(f"\n  Regime switch at step {switch_step} "
+                   f"(split@{sentinel['split']:.0%} of e_mag range)")
             else:
-                print(f"\n  No regime switch (all steps in one regime)")
-            print()
+                _w(f"\n  No regime switch (all steps in one regime)")
+            _w("")
 
         blk0     = blocks[0][1]
         orig_fwd = blk0.forward   # may be SigmaSwitch wrapper (which wraps BlockSkip)
@@ -1544,7 +1551,8 @@ class ShannonPrimeWanRicciSentinel:
             t_gap = now - sentinel['last_t'][0]
 
             # ── Generation boundary: dump log and reset ────────────────────────
-            if sentinel['last_t'][0] > 0 and t_gap > 5.0:
+            # 60s matches BlockSkip's threshold — safe even at 50s/it step times.
+            if sentinel['last_t'][0] > 0 and t_gap > 60.0:
                 _print_log(sentinel['log'])
                 sentinel['log'].clear()
                 sentinel['e_mag_max'][0] = None
@@ -1588,11 +1596,16 @@ class ShannonPrimeWanRicciSentinel:
             sentinel['log'].append(rec)
 
             if verbose:
+                try:
+                    import tqdm as _tqdm
+                    _write = _tqdm.tqdm.write
+                except Exception:
+                    _write = print
                 regime = "HIGH" if is_high else "LOW "
                 rs_str = f"sim={rs0:.3f}" if rs0 is not None else ""
-                print(f"[SP Ricci] step={step_no:3d}  e={e_mag:.3f}  "
-                      f"thr={threshold:.3f}  {regime}  "
-                      f"win[0]={win0}  win[4]={win4}  {rs_str}")
+                _write(f"[SP Ricci] step={step_no:3d}  e={e_mag:.3f}  "
+                       f"thr={threshold:.3f}  {regime}  "
+                       f"win[0]={win0}  win[4]={win4}  {rs_str}")
 
             return orig_fwd(x, e, freqs, context,
                             context_img_len=context_img_len,
