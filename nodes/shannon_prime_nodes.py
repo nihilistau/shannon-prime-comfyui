@@ -911,6 +911,31 @@ class ShannonPrimeWanBlockSkip:
             print("[SP BlockSkip] no Wan blocks found — passing through")
             return (patched,)
 
+        # ── Clear stale caches from previous runs ──────────────────────────────
+        # patch() is called exactly once at the START of every ComfyUI prompt
+        # execution (via model.clone()). Clearing here is guaranteed, unconditional,
+        # and requires zero runtime heuristics — no wall-clock thresholds, no sigma
+        # comparisons. This replaces all generation-boundary detection as the primary
+        # mechanism for preventing stale y from bleeding across generations.
+        _cleared = 0
+        for _i, _blk in blocks:
+            _fwd = getattr(_blk, "forward", None)
+            if _fwd and hasattr(_fwd, "__closure__") and _fwd.__closure__:
+                for _cell in _fwd.__closure__:
+                    try:
+                        _obj = _cell.cell_contents
+                        if isinstance(_obj, dict) and "attn_cache" in _obj:
+                            _obj["attn_cache"].clear()
+                            _obj.get("step_cached", {}).clear()
+                            _obj.get("x_norm", {}).clear()
+                            _obj.get("rolling_sim", {}).clear()
+                            _obj.get("hit_streak", {}).clear()
+                            _cleared += 1
+                    except ValueError:
+                        pass
+        if _cleared:
+            print(f"[SP BlockSkip] cleared {_cleared} stale block-cache(s) from previous run")
+
         n_blocks = len(blocks)
 
         # Tier window map
