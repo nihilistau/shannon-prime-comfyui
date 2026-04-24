@@ -977,10 +977,14 @@ class ShannonPrimeWanBlockSkip:
             state['rolling_sim'][i]   = 1.0
 
         def _cos_sim(a, b):
-            a_f = a.float().reshape(-1)
-            b_f = b.float().reshape(-1)
-            n   = (a_f.norm() * b_f.norm()).clamp(min=1e-10)
-            return float((a_f * b_f).sum() / n)
+            # Single fused GPU pass, one scalar device→host sync at the end.
+            # torch.no_grad avoids autograd overhead on the norm/dot ops.
+            with torch.no_grad():
+                a_f = a.float().reshape(-1)
+                b_f = b.float().reshape(-1)
+                dot = (a_f * b_f).sum()
+                n   = (a_f.norm() * b_f.norm()).clamp_(min=1e-10)
+                return (dot / n).item()   # single sync point
 
         def _x_norm_drift(x_cur, x_norm_cpu):
             """Lightweight x-drift check using per-token norm comparison.
@@ -1078,13 +1082,19 @@ class ShannonPrimeWanBlockSkip:
                 age      = step - cached_s
 
                 # ── Mertens Oracle: preemptive x_drift check ────────────────
-                # Tier-0 (L00-L03): DISABLED by default (x_drift_t0=0.0)
-                #   The rolling oracle handles these correctly; x_drift would
-                #   over-trigger on Wan's aggressive noise schedule.
-                # Tier-1 (L04-L08): x_drift_t1=0.25 catches scene changes
-                #   before the slower rolling oracle detects them.
+                # Tier-0 (L00-L03): disabled (x_drift_t0=0.0 default).
+                #   Sim=1.000 data confirms these blocks are pure Granite;
+                #   the rolling oracle handles them without drift interference.
+                # Tier-1 (L04-L08): per-block tightening toward the boundary.
+                #   L04 is most stable (near Granite); L08 is most volatile
+                #   (Sand/boundary). Threshold decreases linearly from t1 to t1*0.8.
                 x_drift_forced_miss = False
-                x_drift_thr = state['x_drift_t0'] if block_idx < 4 else state['x_drift_t1']
+                if block_idx < 4:
+                    x_drift_thr = state['x_drift_t0']   # disabled for Granite
+                else:
+                    # Linear tightening within tier-1: L04 → t1, L08 → t1*0.80
+                    _frac = (block_idx - 4) / 4.0        # 0.0 at L04, 1.0 at L08
+                    x_drift_thr = state['x_drift_t1'] * (1.0 - 0.20 * _frac)
                 if (x_drift_thr > 0.0 and eff_win > 0 and age > 0
                         and block_idx in state['x_norm']
                         and block_idx in state['attn_cache']):
