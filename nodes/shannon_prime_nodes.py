@@ -1260,7 +1260,15 @@ class ShannonPrimeWanCacheFlush:
                     if n > 0:
                         flushed_blocks += 1
 
-        # Also clear CUDA cache to give VAE maximum VRAM headroom
+        # Unload the Wan UNet from VRAM so VAE decode gets full memory headroom.
+        # comfy.model_management.unload_all_models() tells ComfyUI's memory manager
+        # to evict all currently-loaded models to CPU, then torch.cuda.empty_cache()
+        # releases the freed CUDA pages back to the allocator.
+        try:
+            import comfy.model_management as mm
+            mm.unload_all_models()
+        except Exception:
+            pass
         try:
             import torch
             torch.cuda.empty_cache()
@@ -1268,10 +1276,12 @@ class ShannonPrimeWanCacheFlush:
             pass
 
         if flushed_blocks > 0:
-            print(f"[SP CacheFlush] cleared {flushed_blocks} block caches "
-                  f"+ torch.cuda.empty_cache() — VAE now has full memory headroom")
+            print(f"[SP CacheFlush] cleared {flushed_blocks} block caches, "
+                  f"unloaded all models, torch.cuda.empty_cache() — "
+                  f"VAE now has full memory headroom")
         else:
-            print("[SP CacheFlush] no BlockSkip caches found (node still safe to use)")
+            print("[SP CacheFlush] unloaded all models + torch.cuda.empty_cache() "
+                  "(no BlockSkip caches found)")
 
         return (samples,)
 
@@ -1365,26 +1375,55 @@ class ShannonPrimeWanSigmaSwitch:
             def sigma_forward(x, e, freqs, context, context_img_len=257,
                               transformer_options={}):
                 if block_idx == 0:
-                    # Read current e_mag
-                    e_flat  = e.float().reshape(-1)
-                    e_mag   = float(e_flat.abs().mean())
+                    # Prefer raw sigma from transformer_options (ComfyUI passes it
+                    # as a 1-element tensor in the sigmas list for the current step).
+                    # Fall back to e_mag if unavailable.
+                    raw_sigma = None
+                    try:
+                        sigs = transformer_options.get('sigmas', None)
+                        if sigs is not None and hasattr(sigs, '__len__') and len(sigs) > 0:
+                            raw_sigma = float(sigs[0])
+                    except Exception:
+                        pass
+
+                    if raw_sigma is not None:
+                        sig_val = raw_sigma
+                    else:
+                        sig_val = float(e.float().reshape(-1).abs().mean())
 
                     # Update rolling max/min
                     if sigma_state['e_mag_max'][0] is None:
-                        sigma_state['e_mag_max'][0] = e_mag
-                        sigma_state['e_mag_min'][0] = e_mag
+                        sigma_state['e_mag_max'][0] = sig_val
+                        sigma_state['e_mag_min'][0] = sig_val
                     else:
-                        sigma_state['e_mag_max'][0] = max(sigma_state['e_mag_max'][0], e_mag)
-                        sigma_state['e_mag_min'][0] = min(sigma_state['e_mag_min'][0], e_mag)
+                        sigma_state['e_mag_max'][0] = max(sigma_state['e_mag_max'][0], sig_val)
+                        sigma_state['e_mag_min'][0] = min(sigma_state['e_mag_min'][0], sig_val)
 
-                    e_max = sigma_state['e_mag_max'][0]
-                    e_min = sigma_state['e_mag_min'][0]
-                    e_range = max(e_max - e_min, 1e-6)
-                    threshold = e_min + sigma_state['split'] * e_range
-                    is_high_sigma = e_mag >= threshold
+                    s_max   = sigma_state['e_mag_max'][0]
+                    s_min   = sigma_state['e_mag_min'][0]
+                    s_range = s_max - s_min
+
+                    # Guard: if sigma range is degenerate (< 10% of mean), the
+                    # scheduler isn't giving us enough signal to split reliably.
+                    # Don't apply any multiplier — leave windows at their nominal values.
+                    s_mean = (s_max + s_min) / 2.0 if (s_max + s_min) > 0 else 1.0
+                    range_frac = s_range / max(s_mean, 1e-6)
+                    if range_frac < 0.10:
+                        # Degenerate range — bypass sigma switching
+                        if verbose:
+                            src = "σ" if raw_sigma is not None else "e_mag"
+                            print(f"[SP SigmaSwitch] range too narrow ({src} "
+                                  f"range={s_range:.4f}/{s_mean:.4f}={range_frac:.1%}) "
+                                  f"— bypassing, using nominal windows")
+                        return orig_forward(x, e, freqs, context,
+                                            context_img_len=context_img_len,
+                                            transformer_options=transformer_options)
+
+                    threshold     = s_min + sigma_state['split'] * s_range
+                    is_high_sigma = sig_val >= threshold
 
                     # Find and adjust BlockSkip state's effective_win
-                    fwd = orig_forward  # may itself be a BlockSkip closure
+                    fwd = orig_forward
                     cell_contents = []
                     if hasattr(fwd, "__closure__") and fwd.__closure__:
                         cell_contents = [c.cell_contents for c in fwd.__closure__
@@ -1392,18 +1431,16 @@ class ShannonPrimeWanSigmaSwitch:
                     for obj in cell_contents:
                         if isinstance(obj, dict) and "effective_win" in obj:
                             mult = sigma_state['high_mult'] if is_high_sigma else sigma_state['low_mult']
-                            for blk_i, nom_win in list(obj["effective_win"].items()):
-                                # Re-derive the nominal window from the tier
+                            for blk_i in list(obj["effective_win"].keys()):
                                 nom = 10 if blk_i < 4 else (3 if blk_i < 9 else 0)
                                 if nom > 0:
-                                    new_win = max(1, min(nom * 3,  # hard cap at 3× nominal
-                                                         int(nom * mult)))
+                                    new_win = max(1, min(nom * 3, int(nom * mult)))
                                     obj["effective_win"][blk_i] = new_win
                             if verbose:
-                                mode = "HIGH-sigma" if is_high_sigma else "LOW-sigma"
-                                sample_win = obj["effective_win"].get(0, "?")
-                                print(f"[SP SigmaSwitch] {mode} e={e_mag:.3f} "
-                                      f"thresh={threshold:.3f} win[0]={sample_win}")
+                                mode = "HIGH" if is_high_sigma else "LOW "
+                                src  = "σ" if raw_sigma is not None else "e"
+                                print(f"[SP SigmaSwitch] {mode} {src}={sig_val:.4f} "
+                                      f"thr={threshold:.4f} win[0]={obj['effective_win'].get(0,'?')}")
 
                 return orig_forward(x, e, freqs, context,
                                     context_img_len=context_img_len,
