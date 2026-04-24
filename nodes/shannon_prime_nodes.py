@@ -34,141 +34,8 @@ for p in (_SP_TOOLS, _SP_TORCH):
     if s not in sys.path:
         sys.path.insert(0, s)
 
-from shannon_prime_comfyui import VHT2CrossAttentionCache  # noqa: E402
-from shannon_prime_comfyui import _vht2  # VHT2 dispatch (CUDA or torch)  # noqa: E402
+# shannon_prime_comfyui submodule — only needed by the sqfree node (lazy import there).
 
-# Import MobiusMask + BandedQuantizer from the torch backend (used by VHT2BlockSkipCache)
-from shannon_prime_torch import MobiusMask, BandedQuantizer  # noqa: E402
-
-
-class VHT2BlockSkipCache:
-    """
-    VHT2-compressed y-tensor cache for BlockSkip self-attention.
-
-    On miss: y → VHT2 forward → Möbius reorder → banded quantize → store compressed (CPU)
-    On hit:  load → dequantize → Möbius unreorder → VHT2 inverse → y (GPU)
-
-    This replaces raw fp16/bf16 y storage with ~3.5x compressed spectral
-    coefficients. For a 720p generation (4125 tokens × 5120 dim), each block's
-    y goes from ~40MB to ~11MB. 9 cached blocks: 360MB → ~100MB.
-
-    Self-attention y in Wan DiT has moderate spectral concentration (unlike
-    cross-attention K/V where T5 context is static). The compression is lossy
-    but the adaLN gate re-anchoring on hit already tolerates small errors
-    since it reapplies the current step's gate to the cached pre-gate y.
-    """
-
-    def __init__(self, head_dim=128, band_bits=None, use_mobius=True):
-        self.head_dim = head_dim
-        # Self-attention y uses same spectrum as V — flat bit allocation
-        # Default: [4, 4, 3, 3] = avg 3.5 bits/element → ~3.6x compression
-        if band_bits is None:
-            band_bits = [4, 4, 3, 3]
-        self.quantizer = BandedQuantizer(head_dim, band_bits)
-        self.mobius = MobiusMask(head_dim) if use_mobius else None
-        # block_idx → (scales, quants, orig_shape, orig_dtype)
-        self._cache = {}
-
-    def put(self, block_idx, y):
-        """Compress and store y on CPU."""
-        orig_shape = y.shape
-        orig_dtype = y.dtype
-        y_flat = y.reshape(-1, self.head_dim).float().clone()
-
-        # VHT2 forward (self-inverse, no 1/N)
-        y_flat = _vht2(y_flat)
-
-        # Möbius reorder (concentrates energy into low bands)
-        if self.mobius is not None:
-            y_flat = self.mobius.reorder(y_flat)
-
-        # Banded quantize
-        scales, quants = self.quantizer.quantize(y_flat)
-
-        self._cache[block_idx] = (
-            [s.detach().cpu() for s in scales],
-            [q.detach().cpu() for q in quants],
-            orig_shape,
-            orig_dtype,
-        )
-
-    def get(self, block_idx, device, dtype):
-        """Reconstruct y from compressed cache."""
-        scales, quants, orig_shape, orig_dtype = self._cache[block_idx]
-
-        # Move to target device for reconstruction
-        scales_dev = [s.to(device) for s in scales]
-        quants_dev = [q.to(device) for q in quants]
-
-        # Dequantize
-        y_flat = self.quantizer.dequantize(scales_dev, quants_dev)
-
-        # Möbius unreorder
-        if self.mobius is not None:
-            y_flat = self.mobius.unreorder(y_flat)
-
-        # VHT2 inverse (self-inverse)
-        y_flat = _vht2(y_flat)
-
-        return y_flat.reshape(orig_shape).to(dtype)
-
-    def has(self, block_idx):
-        return block_idx in self._cache
-
-    def shape(self, block_idx):
-        if block_idx in self._cache:
-            return self._cache[block_idx][2]  # orig_shape
-        return None
-
-    def clear(self):
-        self._cache.clear()
-
-    def pop(self, block_idx, default=None):
-        return self._cache.pop(block_idx, default)
-
-    def compare_spectral(self, block_idx, y_new):
-        """
-        Compute cos_sim between cached (compressed) y and new y WITHOUT
-        decompressing the cache to spatial domain.
-
-        VHT2 is orthogonal and self-inverse, so:
-            cos_sim(y_new, y_cached) == cos_sim(VHT2(y_new), VHT2(y_cached))
-
-        The Möbius reorder is just a permutation (orthogonal), so:
-            cos_sim(Möbius(VHT2(y_new)), Möbius(VHT2(y_cached))) == cos_sim(y_new, y_cached)
-
-        We dequantize the stored coefficients on CPU (cheap: just scale+add)
-        and compare against the new y's spectral coefficients, also on CPU.
-        This eliminates the full GPU decompress round-trip that caused the
-        doubling bug in the Mertens Oracle.
-
-        Returns float cos_sim in [0, 1].
-        """
-        if block_idx not in self._cache:
-            return 1.0
-
-        scales, quants, orig_shape, orig_dtype = self._cache[block_idx]
-
-        # Forward-transform y_new into the same spectral domain (on GPU, fast)
-        y_flat = y_new.reshape(-1, self.head_dim).float()
-        y_flat = _vht2(y_flat)
-        if self.mobius is not None:
-            y_flat = self.mobius.reorder(y_flat)
-
-        # Move new spectral coefficients to CPU (one transfer, ~11MB not ~98MB)
-        y_spec_cpu = y_flat.detach().cpu().reshape(-1)
-        del y_flat
-
-        # Dequantize cached coefficients on CPU (no GPU memory needed)
-        cached_flat = self.quantizer.dequantize(scales, quants).reshape(-1)
-
-        # CPU cos_sim — fast enough for a 50M-element vector (~50ms)
-        dot = (y_spec_cpu * cached_flat).sum()
-        norms = (y_spec_cpu.norm() * cached_flat.norm()).clamp_(min=1e-10)
-        return float((dot / norms).item())
-
-    def __contains__(self, block_idx):
-        return block_idx in self._cache
 
 
 def _input_fingerprint(x: torch.Tensor):
@@ -206,48 +73,40 @@ class _SPCachingLinear(nn.Module):
     """
     Drop-in for cross_attn.k / cross_attn.v (and k_img / v_img).
 
-    Caches the linear's output keyed by (key, content_fingerprint(input)).
-    The first call for a given fingerprint computes + compresses; subsequent
-    calls with the same fingerprint reconstruct from the VHT2 cache. When the
-    fingerprint changes (new generation with a different prompt/seed), the
-    stale entry is dropped and refilled on that call.
+    Raw CPU/fp16 cache — no VHT2 compression, no GPU temporaries.
+    Cross-attn K/V are constant across all diffusion timesteps (same prompt
+    = same T5 embeddings = same output). Compute once on step 1, store raw
+    on CPU, return via .to(device) on subsequent steps (~3ms per hit via PCIe).
+
+    Phase 15 LEAN: the VHT2 compress/decompress path created GPU tensor
+    allocation storms on lowvram (160 ops/step × GPU intermediates = CUDA
+    fragmentation → model weight thrashing). Raw CPU eliminates this entirely
+    and fixes the "must cancel first run" warm-up issue.
     """
 
-    def __init__(self, original: nn.Module, cache: VHT2CrossAttentionCache, key: str):
+    def __init__(self, original: nn.Module, key: str):
         super().__init__()
         self.original = original
-        self._sp_cache = cache
         self._sp_key = key
         self._sp_last_fp = None
+        self._sp_cached = None  # raw CPU fp16 tensor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cache = self._sp_cache
-        key = self._sp_key
         fp = _input_fingerprint(x)
 
-        # Cache hit: the conditioning content fingerprint matches what we
-        # stored last time AND we have an entry. Return the reconstructed K/V.
-        if fp == self._sp_last_fp and cache.has(key):
-            out, _ = cache.get(key)
-            return out
+        # Cache hit: same conditioning content, have cached result
+        if fp == self._sp_last_fp and self._sp_cached is not None:
+            return self._sp_cached.to(device=x.device, dtype=x.dtype)
 
-        # Fingerprint changed or no entry — recompute and refill.
+        # Miss: compute, store raw on CPU
         result = self.original(x)
-
-        # Drop any stale entry under the expert-scoped key.
-        stored_key = cache._cache_key(key)
-        cache._cache.pop(stored_key, None)
-
-        # VHT2CrossAttentionCache.put() stores a (k, v) pair; we use the same
-        # tensor for both since each linear is cached independently.
-        cache.put(key, result, result)
+        self._sp_cached = result.detach().cpu()
         self._sp_last_fp = fp
         return result
 
 
-def _wrap_cross_attn(cross_attn: nn.Module, cache: VHT2CrossAttentionCache,
-                     block_idx: int) -> bool:
-    """Wrap .k, .v (and .k_img, .v_img if present) on a cross-attn module."""
+def _wrap_cross_attn(cross_attn: nn.Module, block_idx: int) -> bool:
+    """Wrap .k, .v (and .k_img, .v_img if present) with raw CPU caching."""
     if cross_attn is None:
         return False
     wrapped_any = False
@@ -256,8 +115,11 @@ def _wrap_cross_attn(cross_attn: nn.Module, cache: VHT2CrossAttentionCache,
         if lin is None:
             continue
         if isinstance(lin, _SPCachingLinear):
-            continue  # already wrapped
-        wrapper = _SPCachingLinear(lin, cache, f"block_{block_idx}_{suffix}")
+            # Already wrapped — just clear its cache for the new run
+            lin._sp_cached = None
+            lin._sp_last_fp = None
+            continue
+        wrapper = _SPCachingLinear(lin, f"block_{block_idx}_{suffix}")
         setattr(cross_attn, attr, wrapper)
         wrapped_any = True
     return wrapped_any
@@ -339,16 +201,13 @@ class ShannonPrimeWanCache:
         # re-evaluation each queue.
         return float("nan")
 
-    def patch(self, model, k_bits: str, v_bits: str, use_mobius: bool):
-        k_bits_list = _parse_bits_csv(k_bits, [5, 4, 4, 3], 4)
-        v_bits_list = _parse_bits_csv(v_bits, [5, 4, 4, 3], 4)
+    def patch(self, model, k_bits: str = "5,4,4,3", v_bits: str = "5,4,4,3",
+              use_mobius: bool = True):
+        # Phase 15 LEAN: cross-attn cache is now raw CPU/fp16 — no VHT2.
+        # k_bits, v_bits, use_mobius are retained in INPUT_TYPES for backward
+        # compatibility with saved workflows but are IGNORED. The node just
+        # wraps cross-attn linears with raw CPU caching.
 
-        # Clone the ModelPatcher so we don't mutate the caller's reference.
-        # Note: ComfyUI's ModelPatcher.clone() shares the underlying nn.Module,
-        # so our patches DO persist on the model object across workflows. For
-        # multiple concurrent generations this is benign (same cache state is
-        # safely reused); for switching between different Wan models load them
-        # as separate UNETLoader instances.
         patched = model.clone()
 
         blocks = list(_iter_wan_blocks(patched))
@@ -356,28 +215,15 @@ class ShannonPrimeWanCache:
             print("[Shannon-Prime] ShannonPrimeWanCache: no Wan blocks found on model — passing through")
             return (patched,)
 
-        # Use the first block's head_dim (uniform across Wan architectures).
-        head_dim = blocks[0][1].self_attn.head_dim
-
-        cache = VHT2CrossAttentionCache(
-            head_dim=head_dim,
-            k_band_bits=k_bits_list,
-            v_band_bits=v_bits_list,
-            use_mobius=bool(use_mobius),
-        )
-
         wrapped = 0
         for i, blk in blocks:
-            if _wrap_cross_attn(getattr(blk, "cross_attn", None), cache, i):
+            if _wrap_cross_attn(getattr(blk, "cross_attn", None), i):
                 wrapped += 1
 
-        # Stash cache on the ModelPatcher for stats / inspection via a debug node.
-        patched._sp_cache = cache
-
-        comp_ratio = cache.compression_ratio()
-        print(f"[Shannon-Prime] patched {wrapped}/{len(blocks)} Wan blocks "
-              f"(head_dim={head_dim}, K={k_bits_list}, V={v_bits_list}, "
-              f"möbius={use_mobius}, compression~{comp_ratio:.2f}x)")
+        print(f"[Shannon-Prime] Phase 15 LEAN — patched {wrapped}/{len(blocks)} "
+              f"Wan cross-attn linears with raw CPU/fp16 caching")
+        print(f"[Shannon-Prime] No VHT2, no Möbius, no GPU temporaries — "
+              f"zero VRAM overhead on cache hit")
 
         return (patched,)
 
@@ -399,14 +245,22 @@ class ShannonPrimeWanCacheStats:
         return float("nan")
 
     def report(self, model):
-        cache = getattr(model, "_sp_cache", None)
-        if cache is None:
-            print("[Shannon-Prime] stats: model has no Shannon-Prime cache attached")
-            return (model,)
-        s = cache.stats()
-        print(f"[Shannon-Prime] cache stats: hits={s['hits']} misses={s['misses']} "
-              f"hit_rate={s['hit_rate']:.3f} entries={s['n_entries_cached']} "
-              f"compression={s['compression_ratio']:.2f}x")
+        # Phase 15 LEAN: cross-attn cache is raw CPU/fp16 on each _SPCachingLinear.
+        # Walk the blocks and count cached vs uncached wrappers.
+        hits = 0
+        total = 0
+        for _i, blk in _iter_wan_blocks(model):
+            ca = getattr(blk, "cross_attn", None)
+            if ca is None:
+                continue
+            for attr in ("k", "v", "k_img", "v_img"):
+                lin = getattr(ca, attr, None)
+                if isinstance(lin, _SPCachingLinear):
+                    total += 1
+                    if lin._sp_cached is not None:
+                        hits += 1
+        print(f"[Shannon-Prime] cross-attn cache: {hits}/{total} linears cached "
+              f"(raw CPU/fp16, no VHT2)")
         return (model,)
 
 
@@ -980,69 +834,47 @@ class ShannonPrimeWanCacheFlush:
         return float("nan")
 
     def flush(self, model, samples):
-        # Walk all WanAttentionBlock forwards, clear any BlockSkip state dicts
-        flushed_blocks = 0
+        flushed_blockskip = 0
+        flushed_crossattn = 0
+
         for i, blk in _iter_wan_blocks(model):
+            # ── Clear BlockSkip self-attn caches (closure state dicts) ──
             fwd = getattr(blk, "forward", None)
-            if fwd is None:
-                continue
-            # BlockSkip closures capture a 'state' dict; find and clear it
-            closure_vars = getattr(fwd, "__code__", None)
-            if closure_vars is None:
-                continue
-            cell_contents = []
-            if hasattr(fwd, "__closure__") and fwd.__closure__:
-                cell_contents = [c.cell_contents for c in fwd.__closure__
-                                 if hasattr(c, "cell_contents")]
-            for obj in cell_contents:
-                if isinstance(obj, dict) and "attn_cache" in obj:
-                    # Flush y-tensor dump if active
-                    if obj.get('dump_y') and obj.get('dump_y_data'):
-                        import numpy as _np
-                        gen = obj['dump_y_gen'][0]
-                        obj['dump_y_gen'][0] = gen + 1
-                        out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                               "lib", "shannon-prime", "logs", "phase12")
-                        os.makedirs(out_dir, exist_ok=True)
-                        out_path = os.path.join(out_dir, f"wan_blockskip_y_gen{gen}.npz")
-                        blocks_dump = sorted(obj['dump_y_data'].keys())
-                        save_dict = {'block_indices': _np.array(blocks_dump)}
-                        for bidx in blocks_dump:
-                            step_num, y_np = obj['dump_y_data'][bidx]
-                            save_dict[f'y_block{bidx}'] = y_np
-                            save_dict[f'step_block{bidx}'] = _np.array([step_num])
-                        _np.savez_compressed(out_path, **save_dict)
-                        print(f"[SP CacheFlush] DUMP saved {len(blocks_dump)} blocks "
-                              f"to {out_path}")
-                        obj['dump_y_data'].clear()
+            if fwd and hasattr(fwd, "__closure__") and fwd.__closure__:
+                for cell in fwd.__closure__:
+                    try:
+                        obj = cell.cell_contents
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and "attn_cache" in obj:
+                        n = len(obj["attn_cache"])
+                        obj["attn_cache"].clear()
+                        obj.get("step_cached", {}).clear()
+                        obj.get("hit_streak", {}).clear()
+                        if n > 0:
+                            flushed_blockskip += 1
 
-                    n = len(obj["attn_cache"])
-                    obj["attn_cache"].clear()
-                    obj.get("step_cached", {}).clear()
-                    obj.get("x_norm", {}).clear()
-                    obj.get("rolling_sim", {}).clear()
-                    obj.get("hit_streak", {}).clear()
-                    if n > 0:
-                        flushed_blocks += 1
-                elif isinstance(obj, VHT2BlockSkipCache):
-                    obj.clear()
-                    flushed_blocks += 1
+            # ── Clear cross-attn raw CPU caches (_SPCachingLinear) ──────
+            ca = getattr(blk, "cross_attn", None)
+            if ca is not None:
+                for attr in ("k", "v", "k_img", "v_img"):
+                    lin = getattr(ca, attr, None)
+                    if isinstance(lin, _SPCachingLinear) and lin._sp_cached is not None:
+                        lin._sp_cached = None
+                        lin._sp_last_fp = None
+                        flushed_crossattn += 1
 
-        # Release CUDA pages back to the allocator so VAE decode gets full headroom.
-        # We deliberately do NOT call unload_all_models() here — ComfyUI's own memory
-        # manager handles UNet eviction when the VAE needs VRAM, and calling
-        # unload_all_models() mid-workflow was found to corrupt cross-attn cache state.
         try:
-            import torch
             torch.cuda.empty_cache()
         except Exception:
             pass
 
-        if flushed_blocks > 0:
-            print(f"[SP CacheFlush] cleared {flushed_blocks} block caches "
-                  f"+ torch.cuda.empty_cache() — VAE now has full memory headroom")
+        total = flushed_blockskip + flushed_crossattn
+        if total > 0:
+            print(f"[SP CacheFlush] cleared {flushed_blockskip} BlockSkip + "
+                  f"{flushed_crossattn} cross-attn caches + torch.cuda.empty_cache()")
         else:
-            print("[SP CacheFlush] no BlockSkip caches found (node still safe to use)")
+            print("[SP CacheFlush] no caches found (node still safe to use)")
 
         return (samples,)
 
