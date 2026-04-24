@@ -932,6 +932,7 @@ class ShannonPrimeWanBlockSkip:
             'global_step':    [0],      # step counter (incremented by block-0)
             'last_gen_step':  [0],      # detect new generation (step reset)
             'last_e_mag':     [None],   # timestep-embedding magnitude at last block-0 call
+            'last_block0_t':  [0.0],    # wall-clock time of last block-0 call (generation detector)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
             'attn_cache':     {},       # block_idx -> y tensor (CPU, cleared between gens)
             'step_cached':    {},       # block_idx -> step at which y was cached
@@ -978,32 +979,47 @@ class ShannonPrimeWanBlockSkip:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
-                # ── Generation detection via timestep-embedding magnitude ──────
-                # During denoising, sigma decreases → e magnitude decreases.
-                # A new generation jumps sigma back to max → e magnitude spikes up.
-                # Detects generation boundaries even when model is shared across
-                # ComfyUI workflows (patched_forward persists on the shared nn.Module).
+                # ── Generation detection (block-0 only) ──────────────────────
+                # Three independent signals — any one clears the cache:
+                #
+                # 1. WALL-CLOCK GAP > 5s between consecutive block-0 calls.
+                #    Denoising steps take ~3s each. Between generations the gap
+                #    is 50-100s (VAE decode + model reload). Guaranteed to work
+                #    regardless of model internals or sigma schedule direction.
+                #    THIS IS THE PRIMARY DETECTOR.
+                #
+                # 2. E-magnitude jump ×2 (sigma returned to high value).
+                #
+                # 3. Legacy: stale step_cached or step-counter anomaly.
                 if block_idx == 0:
+                    import time as _time
+                    now     = _time.time()
+                    t_gap   = now - state['last_block0_t'][0]
                     e_flat  = e.float().reshape(-1)
                     e_mag   = float(e_flat.abs().mean())
                     last_em = state['last_e_mag'][0]
+                    last    = state['last_gen_step'][0]
+                    stale   = sum(1 for b, s in state['step_cached'].items()
+                                  if state['global_step'][0] - s < 0)
 
                     is_new_gen = False
-                    if last_em is not None and last_em > 1e-6:
-                        # Sigma jumped upward by >2x → new generation
-                        if e_mag > last_em * 2.0:
-                            is_new_gen = True
-                    # Also catch step-counter anomalies (legacy detection)
-                    last = state['last_gen_step'][0]
-                    stale = sum(1 for b, s in state['step_cached'].items()
-                                if state['global_step'][0] - s < 0)
+                    gap_reason = ""
+                    # Primary: wall-clock gap (catches ALL generation boundaries)
+                    if state['last_block0_t'][0] > 0 and t_gap > 5.0:
+                        is_new_gen = True
+                        gap_reason = f"t_gap={t_gap:.1f}s"
+                    # Secondary: e-magnitude spike upward (sigma reset to max)
+                    if last_em is not None and last_em > 1e-6 and e_mag > last_em * 2.0:
+                        is_new_gen = True
+                        gap_reason += f" e-jump({last_em:.2f}->{e_mag:.2f})"
+                    # Tertiary: step-counter anomalies
                     if stale > 0 or (step <= 2 and last > 5):
                         is_new_gen = True
+                        gap_reason += f" stale={stale}"
 
                     if is_new_gen:
                         if verbose:
-                            print(f"[SP BlockSkip] New generation (e_mag {last_em:.3f}->{e_mag:.3f}) "
-                                  f"— clearing cache")
+                            print(f"[SP BlockSkip] New generation [{gap_reason}] — clearing cache")
                         state['attn_cache'].clear()
                         state['step_cached'].clear()
                         state['x_norm'].clear()
@@ -1012,7 +1028,8 @@ class ShannonPrimeWanBlockSkip:
                         for i in state['effective_win']:
                             state['effective_win'][i] = get_window(i)
 
-                    state['last_e_mag'][0]   = e_mag
+                    state['last_block0_t'][0] = now
+                    state['last_e_mag'][0]    = e_mag
                     state['last_gen_step'][0] = step
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
