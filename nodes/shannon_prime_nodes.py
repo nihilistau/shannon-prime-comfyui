@@ -712,12 +712,18 @@ class ShannonPrimeWanBlockSkip:
       L04-L08: window=3  steps (Stable Sand)
       L09+:    window=0  steps (no cache — volatile)
 
-    VHT2 compression (Phase 13, default ON):
-      Cached y tensors are stored as VHT2 spectral coefficients with Möbius
-      reorder + banded quantization [4,4,3,3] = avg 3.5 bits/element.
-      ~3.5x memory reduction: 360MB → ~100MB for 9 blocks at 720p.
-      The adaLN gate re-anchoring on hit already tolerates reconstruction
-      noise since it reapplies the current step's gate to the cached pre-gate y.
+    Hierarchical cache tiering (Phase 14, default):
+      Tier 0 (L00-L03): GPU-resident — zero overhead on cache hit.
+        No CPU→GPU transfer, no transform, no copy. Direct tensor reuse.
+        ~160MB GPU for 4 blocks at 720p (worth it: these hit 10+ steps).
+      Tier 1 (L04-L08): CPU — fast .to(device) on hit (~5ms per block).
+        ~200MB CPU. Freed during VAE via CacheFlush node.
+      Tier 2 (L09+):    No cache — recompute every step (volatile blocks).
+
+    VHT2 compression (optional, default OFF):
+      Available via vht2_compress=True for extreme VRAM pressure.
+      ~3.5x memory reduction but significant compute overhead at Wan scale
+      (165K vectors × 128D butterfly per block). Not recommended for normal use.
     """
 
     CATEGORY     = "shannon-prime"
@@ -758,11 +764,11 @@ class ShannonPrimeWanBlockSkip:
                         "0.25 matches Wan's per-step latent change envelope. "
                         "Lower = tighter (more recomputes), higher = more aggressive caching."
                     )}),
-                "vht2_compress": ("BOOLEAN", {"default": True,
+                "vht2_compress": ("BOOLEAN", {"default": False,
                     "tooltip": (
                         "Compress cached y with VHT2 spectral transform + banded quantization. "
-                        "~3.5x memory reduction (360MB→100MB for 9 blocks at 720p). "
-                        "Lossy but the adaLN gate re-anchoring tolerates small errors."
+                        "~3.5x memory reduction but significant compute overhead at Wan scale. "
+                        "Default OFF: hierarchical GPU/CPU tiering is faster and lossless."
                     )}),
                 "verbose": ("BOOLEAN", {"default": False}),
                 "dump_y_npz": ("BOOLEAN", {"default": False,
@@ -1133,8 +1139,12 @@ class ShannonPrimeWanBlockSkip:
                         and age >= 0          # age < 0 = stale from prev generation
                         and age < eff_win):
                     # ── CACHE HIT ─────────────────────────────────────────────
+                    # Hierarchical: Tier 0 (GPU) = zero transfer,
+                    #               Tier 1 (CPU) = .to(device)
                     if vht2_cache is not None:
                         y = vht2_cache.get(block_idx, x.device, x.dtype)
+                    elif cached_y.device == x.device:
+                        y = cached_y  # GPU-resident hot block — zero overhead
                     else:
                         y = cached_y.to(device=x.device, dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
@@ -1148,9 +1158,12 @@ class ShannonPrimeWanBlockSkip:
                         elif _rsim_hit > 0.90: _lim = 7
                         elif _rsim_hit > 0.85: _lim = 5
                         else:                  _lim = 3
+                        _tier = "GPU" if (vht2_cache is None and cached_y is not None
+                                          and cached_y.device != torch.device('cpu')) else (
+                                "VHT2" if vht2_cache is not None else "CPU")
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
                               f"step={step} age={age}/{eff_win} streak={streak_now}/{_lim} "
-                              f"sim={_rsim_hit:.3f}")
+                              f"sim={_rsim_hit:.3f} tier={_tier}")
                 else:
                     # ── CACHE MISS: run self-attention ─────────────────────────
                     x = x.contiguous()
@@ -1187,13 +1200,23 @@ class ShannonPrimeWanBlockSkip:
                             # Spectral cos_sim: no GPU decompress needed
                             sim = vht2_cache.compare_spectral(block_idx, y)
                         else:
-                            # CPU cos_sim: no GPU allocation needed
-                            y_cpu = y.detach().float().cpu().reshape(-1)
-                            y_prev_flat = state['attn_cache'][block_idx].float().reshape(-1)
-                            dot = (y_cpu * y_prev_flat).sum()
-                            norms = (y_cpu.norm() * y_prev_flat.norm()).clamp_(min=1e-10)
-                            sim = float((dot / norms).item())
-                            del y_cpu, y_prev_flat
+                            prev = state['attn_cache'][block_idx]
+                            if prev.device == y.device:
+                                # GPU-resident: compute cos_sim on GPU (fast, no transfer)
+                                y_f = y.detach().float().reshape(-1)
+                                p_f = prev.float().reshape(-1)
+                                dot = (y_f * p_f).sum()
+                                norms = (y_f.norm() * p_f.norm()).clamp_(min=1e-10)
+                                sim = float((dot / norms).item())
+                                del y_f, p_f
+                            else:
+                                # CPU cos_sim: no GPU allocation needed
+                                y_cpu = y.detach().float().cpu().reshape(-1)
+                                y_prev_flat = prev.float().reshape(-1)
+                                dot = (y_cpu * y_prev_flat).sum()
+                                norms = (y_cpu.norm() * y_prev_flat.norm()).clamp_(min=1e-10)
+                                sim = float((dot / norms).item())
+                                del y_cpu, y_prev_flat
                         # Exponential moving average
                         state['rolling_sim'][block_idx] = (
                             0.7 * state['rolling_sim'].get(block_idx, 1.0)
@@ -1212,9 +1235,15 @@ class ShannonPrimeWanBlockSkip:
                                   f"roll={state['rolling_sim'][block_idx]:.3f} "
                                   f"win={state['effective_win'][block_idx]}")
 
-                    # Store y — VHT2 compressed or raw CPU
+                    # Store y — hierarchical GPU/CPU tiering
+                    # Tier 0 (L00-L03): GPU-resident — zero overhead on hit
+                    # Tier 1 (L04-L08): CPU — fast .to(device) on hit
+                    # VHT2 (optional): spectral compressed on CPU
                     if vht2_cache is not None:
                         vht2_cache.put(block_idx, y.detach())
+                    elif block_idx < 4 and eff_win > 0:
+                        # Hot block: keep on GPU for zero-cost cache hits
+                        state['attn_cache'][block_idx] = y.detach()
                     else:
                         state['attn_cache'][block_idx] = y.detach().cpu()
                     # Store ONLY per-token norms of x (not full x tensor).
