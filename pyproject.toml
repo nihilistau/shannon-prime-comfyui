@@ -1,0 +1,25 @@
+[project]
+name = "shannon-prime-comfyui"
+version = "1.0.0"
+description = "Shannon-Prime VHT2 cross-attention caching for ComfyUI video generation"
+license = { text = "AGPL-3.0" }
+urls = { Repository = "https://github.com/nihilistau/shannon-prime-comfyui" }
+
+[project.urls]
+Repository = "https://github.com/nihilistau/shannon-prime-comfyui"
+
+[tool.comfy]
+PublisherId = "nihilistau"
+DisplayName = "Shannon-Prime VHT2 Wan Cache"
+Icon = ""
+
+[tool.comfy.node_classes]
+"ShannonPrimeWanCache"          = "Shannon-Prime: Wan Cross-Attn Cache"
+"ShannonPrimeWanCacheStats"     = "Shannon-Prime: Cache Stats"
+"ShannonPrimeWanCacheSqfree"    = "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)"
+"ShannonPrimeWanSelfExtract"    = "Shannon-Prime: Wan Self-Attn Extract (Phase 12)"
+"ShannonPrimeWanBlockCache"     = "Shannon-Prime: Wan Block-Tier Self-Attn Cache"
+"ShannonPrimeWanBlockSkip"      = "Shannon-Prime: Wan Block-Level Self-Attn Skip"
+"ShannonPrimeWanCacheFlush"     = "Shannon-Prime: Wan Block Cache Flush (before VAE)"
+"ShannonPrimeWanSigmaSwitch"    = "Shannon-Prime: Wan Sigma Switch (Phase 13)"
+"ShannonPrimeWanRicciSentinel"  = "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)"
