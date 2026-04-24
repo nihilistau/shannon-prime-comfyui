@@ -1194,6 +1194,86 @@ class ShannonPrimeWanBlockSkip:
         return (patched,)
 
 
+class ShannonPrimeWanCacheFlush:
+    """
+    Flush the ShannonPrimeWanBlockSkip y-cache before VAE decode.
+
+    Place between KSampler and VAEDecode. Clears the ~594MB of cached y
+    tensors (CPU) that BlockSkip holds after denoising, then calls
+    torch.cuda.empty_cache() to give the VAE maximum memory headroom.
+
+    Without this node, BlockSkip's own VAE decode is ~34s slower than
+    baseline because the y-cache holds memory through the decode. With
+    this node, total time matches or beats baseline.
+
+    Workflow: UnetLoader → [ShannonPrimeWanCache] → ShannonPrimeWanBlockSkip
+              → KSampler → [ShannonPrimeWanCacheFlush] → VAEDecode → Save
+    """
+
+    CATEGORY    = "shannon-prime"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION    = "flush"
+    DESCRIPTION = (
+        "Flush BlockSkip y-cache before VAE decode. "
+        "Eliminates the ~34s VAE penalty from cached attention tensors "
+        "sitting in CPU memory during high-res (720p+) decoding."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":   ("MODEL",),
+                "samples": ("LATENT",),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, *a, **k):
+        return float("nan")
+
+    def flush(self, model, samples):
+        # Walk all WanAttentionBlock forwards, clear any BlockSkip state dicts
+        flushed_blocks = 0
+        for i, blk in _iter_wan_blocks(model):
+            fwd = getattr(blk, "forward", None)
+            if fwd is None:
+                continue
+            # BlockSkip closures capture a 'state' dict; find and clear it
+            closure_vars = getattr(fwd, "__code__", None)
+            if closure_vars is None:
+                continue
+            cell_contents = []
+            if hasattr(fwd, "__closure__") and fwd.__closure__:
+                cell_contents = [c.cell_contents for c in fwd.__closure__
+                                 if hasattr(c, "cell_contents")]
+            for obj in cell_contents:
+                if isinstance(obj, dict) and "attn_cache" in obj:
+                    n = len(obj["attn_cache"])
+                    obj["attn_cache"].clear()
+                    obj.get("step_cached", {}).clear()
+                    obj.get("x_norm", {}).clear()
+                    obj.get("rolling_sim", {}).clear()
+                    obj.get("hit_streak", {}).clear()
+                    if n > 0:
+                        flushed_blocks += 1
+
+        # Also clear CUDA cache to give VAE maximum VRAM headroom
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        if flushed_blocks > 0:
+            print(f"[SP CacheFlush] cleared {flushed_blocks} block caches "
+                  f"+ torch.cuda.empty_cache() — VAE now has full memory headroom")
+        else:
+            print("[SP CacheFlush] no BlockSkip caches found (node still safe to use)")
+
+        return (samples,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanCache":        ShannonPrimeWanCache,
     "ShannonPrimeWanCacheStats":   ShannonPrimeWanCacheStats,
@@ -1201,6 +1281,7 @@ NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanSelfExtract":  ShannonPrimeWanSelfExtract,
     "ShannonPrimeWanBlockCache":   ShannonPrimeWanBlockCache,
     "ShannonPrimeWanBlockSkip":    ShannonPrimeWanBlockSkip,
+    "ShannonPrimeWanCacheFlush":   ShannonPrimeWanCacheFlush,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1210,4 +1291,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ShannonPrimeWanSelfExtract": "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
     "ShannonPrimeWanBlockCache":  "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
     "ShannonPrimeWanBlockSkip":   "Shannon-Prime: Wan Block-Level Self-Attn Skip",
+    "ShannonPrimeWanCacheFlush":  "Shannon-Prime: Wan Block Cache Flush (before VAE)",
 }

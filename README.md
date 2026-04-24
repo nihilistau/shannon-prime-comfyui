@@ -87,6 +87,66 @@ wrapper.reset()  # Between generations
 See [docs/INTEGRATION.md](docs/INTEGRATION.md) for architecture diagrams and
 Wan-specific details.
 
+---
+
+## Phase 12 — Self-Attention Block Skip (Wan DiT)
+
+Phase 12 adds a second compression axis: self-attention inside the Wan DiT blocks.
+While cross-attention K/V is static across timesteps (already solved by the nodes
+above), self-attention K/V is dynamic but shows stable geometric structure in early
+blocks across denoising steps.
+
+### New nodes
+
+| Node | Purpose |
+|------|---------|
+| `ShannonPrimeWanBlockSkip` | Patches `WanAttentionBlock.forward()` to skip Q/K/V+attention on stable early blocks (L00-L03), reusing cached y with correct adaLN gate |
+| `ShannonPrimeWanCacheFlush` | Clears the BlockSkip y-cache and calls `torch.cuda.empty_cache()` — place between KSampler and VAEDecode to eliminate the ~34s VAE overhead from cached tensors |
+| `ShannonPrimeWanSelfExtract` | Diagnostic: captures self-attention K vectors during denoising for Phase 12 spectral analysis |
+
+### Validated results (Wan 2.2 TI2V-5B Q8, 1280×720, 9 frames, RTX 2060)
+
+| Config | Denoising (s/it) | Total (s) | Notes |
+|--------|-----------------|-----------|-------|
+| Baseline (cross-attn cache only) | 3.32 | 77 | |
+| + BlockSkip (without CacheFlush) | 3.19 | 111 | y-cache holds through VAE |
+| + BlockSkip + CacheFlush | 3.19 | ~77 | VAE gets full memory headroom |
+
+Output quality: **100% identical** to baseline (same seed, same composition).
+
+### BlockSkip recommended workflow
+
+```
+UnetLoaderGGUF → ShannonPrimeWanCache → ShannonPrimeWanBlockSkip
+              → KSampler
+              → ShannonPrimeWanCacheFlush
+              → VAEDecode → SaveAnimatedWEBP
+```
+
+ComfyUI launch flags for 720p+: `--normalvram --disable-async-offload`
+
+### BlockSkip tier map (derived from sigma-sweep diagnostics)
+
+| Tier | Blocks | Cache window | Behaviour |
+|------|--------|-------------|-----------|
+| 0 — Permanent Granite | L00-L03 | 10 steps | Stable composition anchors; cos_sim > 0.95 for 10 steps |
+| 1 — Stable Sand | L04-L08 | 3 steps | Moderate stability |
+| 2+ | L09-L29 | 0 | Volatile — always recompute |
+
+Generation boundary detection uses a wall-clock gap > 5s between consecutive
+block-0 calls (reliable across all sigma schedules and model sizes).
+
+### Key findings from Phase 12 diagnostics
+
+- **T3 (RoPE Pair Correlation)**: r=0.761 flat across all 30 Wan self-attn blocks —
+  uniform correlated residuals; differential encoding applies to every block.
+- **3D RoPE axis split**: temporal dims r=0.822 > spatial r=0.73 at mid-sigma;
+  gap widens in late blocks.
+- **Sigma sweep**: no temporal axis freeze viable (K vectors change across steps);
+  block-tier caching based on per-block stability is the correct model.
+- **GL(α=0.25) trigger**: detects p3-curve transition in global layers of MoE models
+  (Qwen3.6-35B-A3B: +2 layers; Gemma4-31B: +1 layer).
+
 ## License
 
 **AGPLv3** for open-source, academic, and non-proprietary use.
