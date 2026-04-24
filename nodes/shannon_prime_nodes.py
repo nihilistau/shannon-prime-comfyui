@@ -35,6 +35,99 @@ for p in (_SP_TOOLS, _SP_TORCH):
         sys.path.insert(0, s)
 
 from shannon_prime_comfyui import VHT2CrossAttentionCache  # noqa: E402
+from shannon_prime_comfyui import _vht2  # VHT2 dispatch (CUDA or torch)  # noqa: E402
+
+# Import MobiusMask + BandedQuantizer from the torch backend (used by VHT2BlockSkipCache)
+from shannon_prime_torch import MobiusMask, BandedQuantizer  # noqa: E402
+
+
+class VHT2BlockSkipCache:
+    """
+    VHT2-compressed y-tensor cache for BlockSkip self-attention.
+
+    On miss: y → VHT2 forward → Möbius reorder → banded quantize → store compressed (CPU)
+    On hit:  load → dequantize → Möbius unreorder → VHT2 inverse → y (GPU)
+
+    This replaces raw fp16/bf16 y storage with ~3.5x compressed spectral
+    coefficients. For a 720p generation (4125 tokens × 5120 dim), each block's
+    y goes from ~40MB to ~11MB. 9 cached blocks: 360MB → ~100MB.
+
+    Self-attention y in Wan DiT has moderate spectral concentration (unlike
+    cross-attention K/V where T5 context is static). The compression is lossy
+    but the adaLN gate re-anchoring on hit already tolerates small errors
+    since it reapplies the current step's gate to the cached pre-gate y.
+    """
+
+    def __init__(self, head_dim=128, band_bits=None, use_mobius=True):
+        self.head_dim = head_dim
+        # Self-attention y uses same spectrum as V — flat bit allocation
+        # Default: [4, 4, 3, 3] = avg 3.5 bits/element → ~3.6x compression
+        if band_bits is None:
+            band_bits = [4, 4, 3, 3]
+        self.quantizer = BandedQuantizer(head_dim, band_bits)
+        self.mobius = MobiusMask(head_dim) if use_mobius else None
+        # block_idx → (scales, quants, orig_shape, orig_dtype)
+        self._cache = {}
+
+    def put(self, block_idx, y):
+        """Compress and store y on CPU."""
+        orig_shape = y.shape
+        orig_dtype = y.dtype
+        y_flat = y.reshape(-1, self.head_dim).float().clone()
+
+        # VHT2 forward (self-inverse, no 1/N)
+        y_flat = _vht2(y_flat)
+
+        # Möbius reorder (concentrates energy into low bands)
+        if self.mobius is not None:
+            y_flat = self.mobius.reorder(y_flat)
+
+        # Banded quantize
+        scales, quants = self.quantizer.quantize(y_flat)
+
+        self._cache[block_idx] = (
+            [s.detach().cpu() for s in scales],
+            [q.detach().cpu() for q in quants],
+            orig_shape,
+            orig_dtype,
+        )
+
+    def get(self, block_idx, device, dtype):
+        """Reconstruct y from compressed cache."""
+        scales, quants, orig_shape, orig_dtype = self._cache[block_idx]
+
+        # Move to target device for reconstruction
+        scales_dev = [s.to(device) for s in scales]
+        quants_dev = [q.to(device) for q in quants]
+
+        # Dequantize
+        y_flat = self.quantizer.dequantize(scales_dev, quants_dev)
+
+        # Möbius unreorder
+        if self.mobius is not None:
+            y_flat = self.mobius.unreorder(y_flat)
+
+        # VHT2 inverse (self-inverse)
+        y_flat = _vht2(y_flat)
+
+        return y_flat.reshape(orig_shape).to(dtype)
+
+    def has(self, block_idx):
+        return block_idx in self._cache
+
+    def shape(self, block_idx):
+        if block_idx in self._cache:
+            return self._cache[block_idx][2]  # orig_shape
+        return None
+
+    def clear(self):
+        self._cache.clear()
+
+    def pop(self, block_idx, default=None):
+        return self._cache.pop(block_idx, default)
+
+    def __contains__(self, block_idx):
+        return block_idx in self._cache
 
 
 def _input_fingerprint(x: torch.Tensor):
@@ -549,274 +642,13 @@ def _save(state, out_path, n_blocks, capture_step, head_dim):
           f"--input {out_path} --sqfree --layer-period 4 --global-offset 3")
 
 
-class ShannonPrimeWanBlockCache:
-    """
-    Phase 12 Block-Tier Self-Attention Cache for Wan 2.x DiT.
-
-    Based on sigma-sweep findings (steps 5/15/20/35/45 across all 30 blocks):
-      L00-L03  cos_sim > 0.95 at +10 steps → 10-step cache window  (Permanent Granite)
-      L04-L08  cos_sim ~0.83 at +10 steps  →  3-step cache window  (Stable Sand)
-      L09+     cos_sim < 0.75 at +10 steps  → no cache (recompute every step)
-
-    Intercepts blk.self_attn.k, applies VHT2 compression, and stores spectral
-    coefficients. During cached steps returns the reconstructed K from stored
-    coefficients — skipping the linear forward entirely.
-
-    Storage format: VHT2 skeleton coefficients (not reconstructed tensors).
-    At 4K resolution this saves ~3.3x VRAM vs storing full K tensors per block.
-
-    The node is orthogonal to ShannonPrimeWanCache (cross-attention).
-    Both can be applied together for maximum VRAM savings.
-    """
-
-    # Block stability tiers derived from sigma-sweep Phase 12 data.
-    # (block_idx, cache_window_steps)
-    BLOCK_TIERS = {
-        0: 10, 1: 10, 2: 10, 3: 10,   # Permanent Granite: cos_sim > 0.95
-        4:  3, 5:  3, 6:  3, 7:  3, 8:  3,   # Stable Sand
-        # L09+: no cache (default window=0)
-    }
-    DEFAULT_WINDOW = 0   # blocks not in BLOCK_TIERS are never cached
-
-    CATEGORY     = "shannon-prime"
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION     = "patch"
-    DESCRIPTION  = (
-        "Block-tier self-attention K cache for Wan DiT. "
-        "Early blocks (L00-L03) cached for 10 steps; L04-L08 for 3 steps; "
-        "L09+ recomputed every step. Stores VHT2 coefficients to save VRAM. "
-        "Orthogonal to ShannonPrimeWanCache — use together for max savings."
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-            },
-            "optional": {
-                "skeleton_frac": ("FLOAT", {
-                    "default": 0.30, "min": 0.10, "max": 0.75, "step": 0.05,
-                    "tooltip": "VHT2 skeleton fraction for cached K (0.30 = 30% of coefficients)"}),
-                "tier_0_window": ("INT", {
-                    "default": 10, "min": 0, "max": 30,
-                    "tooltip": "Cache window for blocks L00-L03 (Permanent Granite, default 10)"}),
-                "tier_1_window": ("INT", {
-                    "default": 3, "min": 0, "max": 15,
-                    "tooltip": "Cache window for blocks L04-L08 (Stable Sand, default 3)"}),
-                "verbose": ("BOOLEAN", {"default": False}),
-            },
-        }
-
-    @classmethod
-    def IS_CHANGED(cls, *a, **k):
-        return float("nan")
-
-    def patch(self, model, skeleton_frac=0.30,
-              tier_0_window=10, tier_1_window=3, verbose=False):
-        import math
-
-        patched = model.clone()
-        blocks  = list(_iter_wan_blocks(patched))
-        if not blocks:
-            print("[SP BlockCache] no Wan blocks found — passing through")
-            return (patched,)
-
-        n_blocks = len(blocks)
-        head_dim = blocks[0][1].self_attn.head_dim
-
-        # Build tier map
-        tier_map = {}
-        for i in range(4):
-            tier_map[i] = tier_0_window
-        for i in range(4, 9):
-            tier_map[i] = tier_1_window
-        # blocks 9+ get window=0 (no cache)
-
-        # Shared cache state
-        cache = {
-            'coeffs':      {},    # block_idx -> VHT2 coefficient tensor
-            'step_cached': {},    # block_idx -> step at which it was cached
-            'global_step': [0],   # [step_counter] — mutable via closure
-            'skel_frac':   skeleton_frac,
-            'head_dim':    head_dim,
-            'verbose':     verbose,
-        }
-
-        def _get_sqfree_dim(d):
-            """Nearest sqfree-rich dim >= d for VHT2."""
-            table = {64: 66, 96: 110, 128: 154, 256: 330}
-            if d in table:
-                return table[d]
-            n = d
-            while n < d * 2:
-                distinct, rem, ok = 0, n, True
-                for p in [2, 3, 5, 7, 11]:
-                    if rem % p == 0:
-                        distinct += 1
-                        rem //= p
-                        if rem % p == 0:
-                            ok = False; break
-                if ok and rem == 1 and distinct >= 3:
-                    return n
-                n += 1
-            return d
-
-        analysis_dim = _get_sqfree_dim(head_dim)
-
-        def _algebraic_skeleton(dim, frac):
-            """T2 algebraic skeleton indices at given fraction."""
-            indices = [0]
-            for i in range(1, dim):
-                d = i
-                for p in [2, 3]:
-                    while d % p == 0:
-                        d //= p
-                if d == 1:
-                    indices.append(i)
-            indices = sorted(indices)
-            k = max(1, int(frac * dim))
-            return indices[:min(k, len(indices))]
-
-        skel_indices = _algebraic_skeleton(analysis_dim, skeleton_frac)
-        skel_mask    = torch.zeros(analysis_dim, dtype=torch.float32)
-        for idx in skel_indices:
-            if idx < analysis_dim:
-                skel_mask[idx] = 1.0
-
-        def make_k_hook(block_idx, window):
-            """Return forward hook for blk.self_attn.k at block_idx."""
-
-            def hook(module, args, output):
-                step     = cache['global_step'][0]
-                cached_s = cache['step_cached'].get(block_idx, -999)
-                age      = step - cached_s
-
-                if window > 0 and age < window and block_idx in cache['coeffs']:
-                    # --- Cache HIT: decode from VHT2 coefficients ---
-                    coeffs = cache['coeffs'][block_idx]   # stored on CPU
-                    dev    = output.device
-                    dtype  = output.dtype
-                    orig_shape = output.shape
-
-                    # Flatten, pad, apply mask, return to original dtype+device
-                    flat = output.reshape(-1, output.shape[-1]).float()
-                    # Pad to analysis_dim if needed
-                    if flat.shape[-1] < analysis_dim:
-                        pad = torch.full(
-                            (flat.shape[0], analysis_dim - flat.shape[-1]),
-                            flat.mean().item(), device=flat.device)
-                        flat_pad = torch.cat([flat, pad], dim=-1)
-                    else:
-                        flat_pad = flat[:, :analysis_dim]
-
-                    # Use cached coefficients as the "spectrum" and reconstruct
-                    c = coeffs.to(flat_pad.device)
-                    # Expand to batch if needed
-                    if c.shape[0] == 1 and flat_pad.shape[0] > 1:
-                        c = c.expand(flat_pad.shape[0], -1)
-                    elif c.shape[0] != flat_pad.shape[0]:
-                        c = cache['coeffs'][block_idx].to(flat_pad.device)
-                        if c.shape[0] != flat_pad.shape[0]:
-                            # Mismatch — skip cache this step
-                            if cache['verbose']:
-                                print(f"[SP BlockCache] B{block_idx} shape mismatch, miss")
-                            return
-
-                    # Reconstructed = inverse VHT2 of masked coeffs (VHT2 is self-inverse)
-                    # We use the stored coefficients directly as a proxy reconstruction
-                    # (avoids implementing VHT2 in the hook; the error is < skeleton_frac)
-                    recon_pad = c * skel_mask.to(c.device)
-                    recon     = recon_pad[:, :output.shape[-1]]
-                    result    = recon.reshape(orig_shape).to(dtype=dtype, device=dev)
-
-                    if cache['verbose']:
-                        print(f"[SP BlockCache] B{block_idx} CACHE HIT  "
-                              f"step={step} age={age}/{window}")
-                    return result
-
-                # --- Cache MISS: compute normally, store VHT2 coefficients ---
-                # output is the fresh linear projection result
-                orig_shape = output.shape
-                flat = output.detach().float().reshape(-1, output.shape[-1])
-
-                # Pad to analysis_dim
-                if flat.shape[-1] < analysis_dim:
-                    pad = torch.full(
-                        (flat.shape[0], analysis_dim - flat.shape[-1]),
-                        flat.mean().item(), device=flat.device)
-                    flat_pad = torch.cat([flat, pad], dim=-1)
-                else:
-                    flat_pad = flat[:, :analysis_dim]
-
-                # VHT2 skeleton approximation (store compressed coeffs on CPU)
-                # Simple approach: use the raw values as pseudo-coefficients
-                # (proper VHT2 would require the Hartley butterfly — costly here)
-                # Store the full padded output as the "coefficient" reference
-                coeffs_cpu = flat_pad.cpu()
-                cache['coeffs'][block_idx]      = coeffs_cpu
-                cache['step_cached'][block_idx] = step
-
-                if cache['verbose'] and window > 0:
-                    print(f"[SP BlockCache] B{block_idx} CACHE STORE "
-                          f"step={step} window={window}")
-
-            return hook
-
-        # Attach step counter via block-0 K hook
-        # Global step increments each time block-0's K is called
-        def step_counter_hook(module, args, output):
-            cache['global_step'][0] += 1
-
-        # Attach hooks to all blocks
-        n_hooked = 0
-        for i, blk in blocks:
-            sa = getattr(blk, "self_attn", None)
-            if sa is None:
-                continue
-            k_lin = None
-            for attr in ("k", "k_proj", "to_k", "wk", "key"):
-                candidate = getattr(sa, attr, None)
-                if isinstance(candidate, nn.Module):
-                    k_lin = candidate
-                    break
-            if k_lin is None:
-                continue
-
-            window = tier_map.get(i, self.DEFAULT_WINDOW)
-
-            if i == 0:
-                k_lin.register_forward_pre_hook(
-                    lambda m, a: (cache['global_step'].__setitem__(0,
-                        cache['global_step'][0] + 1), None)[1]
-                )
-
-            if window > 0:
-                k_lin.register_forward_hook(make_k_hook(i, window))
-                n_hooked += 1
-
-        tier0_blocks = [i for i in range(min(4, n_blocks))]
-        tier1_blocks = [i for i in range(4, min(9, n_blocks))]
-        print(f"[SP BlockCache] {n_blocks} Wan blocks | head_dim={head_dim} "
-              f"analysis_dim={analysis_dim}")
-        print(f"[SP BlockCache] Tier-0 (window={tier_0_window}): "
-              f"blocks {tier0_blocks}  [{len(tier0_blocks)} blocks cached]")
-        print(f"[SP BlockCache] Tier-1 (window={tier_1_window}): "
-              f"blocks {tier1_blocks}  [{len(tier1_blocks)} blocks cached]")
-        print(f"[SP BlockCache] skeleton_frac={skeleton_frac:.0%} "
-              f"({len(skel_indices)}/{analysis_dim} coefficients stored)")
-
-        return (patched,)
-
 
 class ShannonPrimeWanBlockSkip:
     """
-    Phase 12 Block-Level Self-Attention Skip for Wan 2.x DiT.
+    Phase 12/13 Block-Level Self-Attention Skip for Wan 2.x DiT.
 
-    Upgrades ShannonPrimeWanBlockCache from K-hook level to block-forward level.
-    Instead of just caching the K projection, this patches WanAttentionBlock.forward()
-    to skip the ENTIRE self-attention computation (Q/K/V projections + attention scores)
-    on cache-hit steps.
+    Patches WanAttentionBlock.forward() to skip the ENTIRE self-attention
+    computation (Q/K/V projections + attention scores) on cache-hit steps.
 
     adaLN-correct cache hit path:
       1. Recompute adaLN modulation from current timestep embedding (trivial cost)
@@ -838,6 +670,13 @@ class ShannonPrimeWanBlockSkip:
       L00-L03: window=10 steps (Permanent Granite, cos_sim>0.95)
       L04-L08: window=3  steps (Stable Sand)
       L09+:    window=0  steps (no cache — volatile)
+
+    VHT2 compression (Phase 13, default ON):
+      Cached y tensors are stored as VHT2 spectral coefficients with Möbius
+      reorder + banded quantization [4,4,3,3] = avg 3.5 bits/element.
+      ~3.5x memory reduction: 360MB → ~100MB for 9 blocks at 720p.
+      The adaLN gate re-anchoring on hit already tolerates reconstruction
+      noise since it reapplies the current step's gate to the cached pre-gate y.
     """
 
     CATEGORY     = "shannon-prime"
@@ -878,6 +717,12 @@ class ShannonPrimeWanBlockSkip:
                         "0.25 matches Wan's per-step latent change envelope. "
                         "Lower = tighter (more recomputes), higher = more aggressive caching."
                     )}),
+                "vht2_compress": ("BOOLEAN", {"default": True,
+                    "tooltip": (
+                        "Compress cached y with VHT2 spectral transform + banded quantization. "
+                        "~3.5x memory reduction (360MB→100MB for 9 blocks at 720p). "
+                        "Lossy but the adaLN gate re-anchoring tolerates small errors."
+                    )}),
                 "verbose": ("BOOLEAN", {"default": False}),
             },
         }
@@ -889,6 +734,7 @@ class ShannonPrimeWanBlockSkip:
     def patch(self, model, tier_0_window=10, tier_1_window=3,
               drift_threshold=0.85,
               x_drift_t0=0.30, x_drift_t1=0.25,
+              vht2_compress=True,
               verbose=False):
         import types
         import comfy.model_management
@@ -931,6 +777,9 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("rolling_sim", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _cleared += 1
+                        elif isinstance(_obj, VHT2BlockSkipCache):
+                            _obj.clear()
+                            _cleared += 1
                     except ValueError:
                         pass
         if _cleared:
@@ -950,6 +799,21 @@ class ShannonPrimeWanBlockSkip:
         # See the streak_forced_miss block below for the full tiered logic.
         # (max_streak is no longer a fixed constant; it adapts to oracle confidence)
 
+        # ── VHT2 compressed block cache (optional, default ON) ───────────
+        # When vht2_compress=True, y tensors are stored as VHT2 spectral
+        # coefficients with banded quantization (~3.5x compression).
+        # When False, raw y tensors are stored on CPU (original behavior).
+        vht2_cache = None
+        if vht2_compress:
+            try:
+                # head_dim=128 for all Wan models (5120/40=128, 1536/12=128, 3072/24=128)
+                vht2_cache = VHT2BlockSkipCache(head_dim=128,
+                                                 band_bits=[4, 4, 3, 3],
+                                                 use_mobius=True)
+            except Exception as _e:
+                print(f"[SP BlockSkip] VHT2 cache init failed ({_e}) — falling back to raw storage")
+                vht2_cache = None
+
         # Shared state across all patched blocks
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
@@ -957,7 +821,7 @@ class ShannonPrimeWanBlockSkip:
             'last_e_mag':     [None],   # timestep-embedding magnitude at last block-0 call
             'last_block0_t':  [0.0],    # wall-clock time of last block-0 call (generation detector)
             'hit_streak':     {},       # block_idx -> consecutive cache-hit count
-            'attn_cache':     {},       # block_idx -> y tensor (CPU, cleared between gens)
+            'attn_cache':     {},       # block_idx -> y tensor (CPU) or VHT2BlockSkipCache
             'step_cached':    {},       # block_idx -> step at which y was cached
             'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
             'effective_win':  {},       # block_idx -> current effective window
@@ -1055,6 +919,8 @@ class ShannonPrimeWanBlockSkip:
                         if verbose:
                             print(f"[SP BlockSkip] New generation [{gap_reason}] — clearing cache")
                         state['attn_cache'].clear()
+                        if vht2_cache is not None:
+                            vht2_cache.clear()
                         state['step_cached'].clear()
                         state['x_norm'].clear()
                         state['rolling_sim'].clear()
@@ -1099,9 +965,11 @@ class ShannonPrimeWanBlockSkip:
                     # Linear tightening within tier-1: L04 → t1, L08 → t1*0.80
                     _frac = (block_idx - 4) / 4.0        # 0.0 at L04, 1.0 at L08
                     x_drift_thr = state['x_drift_t1'] * (1.0 - 0.20 * _frac)
+                _has_cache = (vht2_cache.has(block_idx) if vht2_cache is not None
+                              else block_idx in state['attn_cache'])
                 if (x_drift_thr > 0.0 and eff_win > 0 and age > 0
                         and block_idx in state['x_norm']
-                        and block_idx in state['attn_cache']):
+                        and _has_cache):
                     x_dr = _x_norm_drift(x, state['x_norm'][block_idx])
                     if x_dr > x_drift_thr:
                         x_drift_forced_miss = True
@@ -1131,7 +999,7 @@ class ShannonPrimeWanBlockSkip:
                     _adaptive_streak = 3
                 streak = state['hit_streak'].get(block_idx, 0)
                 streak_forced_miss = (eff_win > 0 and streak >= _adaptive_streak
-                                      and block_idx in state['attn_cache'])
+                                      and _has_cache)
                 if streak_forced_miss:
                     state['hit_streak'][block_idx] = 0   # reset counter
                     if verbose:
@@ -1142,15 +1010,26 @@ class ShannonPrimeWanBlockSkip:
                 # Shape validation: cached y must match current x token count.
                 # Mismatch = stale cache from a different resolution or prompt
                 # (e.g., 480p y reused in a 720p run → scan-line warping).
-                cached_y = state['attn_cache'].get(block_idx)
-                shape_ok = (cached_y is not None
-                            and cached_y.shape[0] == x.shape[0]   # batch
-                            and cached_y.shape[1] == x.shape[1])  # tokens
-                if not shape_ok and cached_y is not None:
-                    # Resolution or batch changed — purge stale cache
-                    del state['attn_cache'][block_idx]
-                    state['x_norm'].pop(block_idx, None)
-                    state['step_cached'].pop(block_idx, None)
+                if vht2_cache is not None:
+                    _cached_shape = vht2_cache.shape(block_idx)
+                    has_cached = _cached_shape is not None
+                    shape_ok = (has_cached
+                                and _cached_shape[0] == x.shape[0]
+                                and _cached_shape[1] == x.shape[1])
+                    if not shape_ok and has_cached:
+                        vht2_cache.pop(block_idx)
+                        state['x_norm'].pop(block_idx, None)
+                        state['step_cached'].pop(block_idx, None)
+                else:
+                    cached_y = state['attn_cache'].get(block_idx)
+                    has_cached = cached_y is not None
+                    shape_ok = (has_cached
+                                and cached_y.shape[0] == x.shape[0]
+                                and cached_y.shape[1] == x.shape[1])
+                    if not shape_ok and has_cached:
+                        del state['attn_cache'][block_idx]
+                        state['x_norm'].pop(block_idx, None)
+                        state['step_cached'].pop(block_idx, None)
 
                 if (not x_drift_forced_miss and not streak_forced_miss
                         and shape_ok
@@ -1158,7 +1037,10 @@ class ShannonPrimeWanBlockSkip:
                         and age >= 0          # age < 0 = stale from prev generation
                         and age < eff_win):
                     # ── CACHE HIT ─────────────────────────────────────────────
-                    y = cached_y.to(device=x.device, dtype=x.dtype)
+                    if vht2_cache is not None:
+                        y = vht2_cache.get(block_idx, x.device, x.dtype)
+                    else:
+                        y = cached_y.to(device=x.device, dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
                     state['hit_streak'][block_idx] = state['hit_streak'].get(block_idx, 0) + 1
@@ -1184,10 +1066,16 @@ class ShannonPrimeWanBlockSkip:
                     )
 
                     # ── Mertens Oracle: update rolling cos_sim ─────────────────
-                    if block_idx in state['attn_cache'] and eff_win > 0:
-                        y_prev = state['attn_cache'][block_idx].to(device=y.device,
-                                                                    dtype=y.dtype)
+                    _has_prev = (vht2_cache.has(block_idx) if vht2_cache is not None
+                                 else block_idx in state['attn_cache'])
+                    if _has_prev and eff_win > 0:
+                        if vht2_cache is not None:
+                            y_prev = vht2_cache.get(block_idx, y.device, y.dtype)
+                        else:
+                            y_prev = state['attn_cache'][block_idx].to(
+                                device=y.device, dtype=y.dtype)
                         sim = _cos_sim(y, y_prev)
+                        del y_prev
                         # Exponential moving average
                         state['rolling_sim'][block_idx] = (
                             0.7 * state['rolling_sim'].get(block_idx, 1.0)
@@ -1206,9 +1094,11 @@ class ShannonPrimeWanBlockSkip:
                                   f"roll={state['rolling_sim'][block_idx]:.3f} "
                                   f"win={state['effective_win'][block_idx]}")
 
-                    # Store y on CPU. GPU y-cache competed with ComfyUI's memory
-                    # management and caused VRAM death spirals at 720p+ (3s->40s/it).
-                    state['attn_cache'][block_idx]  = y.detach().cpu()
+                    # Store y — VHT2 compressed or raw CPU
+                    if vht2_cache is not None:
+                        vht2_cache.put(block_idx, y.detach())
+                    else:
+                        state['attn_cache'][block_idx] = y.detach().cpu()
                     # Store ONLY per-token norms of x (not full x tensor).
                     # Full x at 720p = 66MB per block = 594MB total held across VAE decode.
                     # Per-token norm = 43KB per block. Eliminates the 142-second VAE penalty.
@@ -1263,10 +1153,12 @@ class ShannonPrimeWanBlockSkip:
                 (getattr(blk, 'self_attn', None) for _, blk in blocks if
                  getattr(blk, 'self_attn', None) is not None), None
             )
+            _vht2_str = "ON (~3.5x)" if vht2_cache is not None else "OFF (raw fp16)"
             print(f"[SP BlockSkip] ── Run settings ──────────────────────────────────────────")
             print(f"[SP BlockSkip]   blocks={n_blocks}  tier0_win={tier_0_window}  tier1_win={tier_1_window}")
             print(f"[SP BlockSkip]   drift_thr={drift_threshold}  x_drift_t0={x_drift_t0}  x_drift_t1={x_drift_t1}")
-            print(f"[SP BlockSkip]   verbose={verbose}  streak=adaptive(sim>0.95→10, >0.90→7, >0.85→5, else→3)")
+            print(f"[SP BlockSkip]   vht2_compress={_vht2_str}  verbose={verbose}")
+            print(f"[SP BlockSkip]   streak=adaptive(sim>0.95→10, >0.90→7, >0.85→5, else→3)")
         except Exception:
             pass
         print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
@@ -1338,6 +1230,9 @@ class ShannonPrimeWanCacheFlush:
                     obj.get("hit_streak", {}).clear()
                     if n > 0:
                         flushed_blocks += 1
+                elif isinstance(obj, VHT2BlockSkipCache):
+                    obj.clear()
+                    flushed_blocks += 1
 
         # Release CUDA pages back to the allocator so VAE decode gets full headroom.
         # We deliberately do NOT call unload_all_models() here — ComfyUI's own memory
@@ -1369,16 +1264,24 @@ class ShannonPrimeWanSigmaSwitch:
     Sand), the model refines textures and the blocks drift faster — we cache
     conservatively.
 
-    This node wraps BlockSkip's existing state and adjusts effective_win
-    dynamically at each block-0 call based on the current e_mag (timestep
-    embedding magnitude, which encodes sigma). It reads and modifies the
-    shared state dict captured by BlockSkip's closures.
+    Sigma source: registers a model_function_wrapper on ComfyUI's ModelPatcher
+    via set_model_unet_function_wrapper(). The wrapper fires once per denoising
+    step and receives the raw sigma tensor directly from the sampler via
+    args_dict["timestep"]. This is more direct than reading
+    transformer_options['sigmas'] inside block forwards, and avoids any
+    dict-propagation ambiguity through the model forward chain.
+
+    The captured sigma is stored in a shared dict (_sp_sigma_state on the
+    patched model) so downstream nodes (RicciSentinel) can read it without
+    closure-chain walking.
 
     Mechanism:
-      - Tracks rolling e_mag max and min across the generation.
+      - model_function_wrapper captures real sigma each step, tracks rolling
+        max and min across the generation.
+      - Block-0 forward hook reads current sigma and classifies as HIGH/LOW.
       - Above threshold (high sigma): effective_win *= high_mult (more caching)
       - Below threshold (low sigma):  effective_win *= low_mult  (less caching)
-      - The switch point is sigma_split_frac of the [min, max] e_mag range.
+      - The switch point is sigma_split_frac of the [min, max] sigma range.
 
     Phase 12 data supports this:
       - Sigma sweep showed blocks L00-L03 cos_sim > 0.95 at steps 2-9 (high sigma)
@@ -1413,8 +1316,8 @@ class ShannonPrimeWanSigmaSwitch:
                                "0.5 = half the cache window in late steps (more recompute)."}),
                 "sigma_split_frac": ("FLOAT", {
                     "default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05,
-                    "tooltip": "Fraction of the e_mag range at which to switch. "
-                               "0.5 = switch at midpoint between max and min e_mag."}),
+                    "tooltip": "Fraction of the sigma range at which to switch. "
+                               "0.5 = switch at midpoint between max and min sigma."}),
                 "verbose": ("BOOLEAN", {"default": False}),
             },
         }
@@ -1431,16 +1334,53 @@ class ShannonPrimeWanSigmaSwitch:
             print("[SP SigmaSwitch] no Wan blocks found — passing through")
             return (patched,)
 
-        # Shared sigma tracker (separate from BlockSkip state)
+        # ── Shared sigma state ────────────────────────────────────────────────
+        # Populated by the model_function_wrapper (fires once per denoising
+        # step with real sigma from the sampler) and consumed by the block-0
+        # forward hook below + RicciSentinel (if attached downstream).
         sigma_state = {
-            'e_mag_max':   [None],   # rolling max sigma seen in this generation
-            'e_mag_min':   [None],   # rolling min sigma seen in this generation
-            'high_mult':   high_sigma_mult,
-            'low_mult':    low_sigma_mult,
-            'split':       sigma_split_frac,
-            'has_sigmas':  [None],   # True/False/None; latched at first block-0 call
-            'bypassed':    [False],  # latched True if sigma source is degenerate
+            'current_sigma': [None],  # float — latest sigma from sampler
+            'sigma_max':     [None],  # rolling max sigma this generation
+            'sigma_min':     [None],  # rolling min sigma this generation
+            'high_mult':     high_sigma_mult,
+            'low_mult':      low_sigma_mult,
+            'split':         sigma_split_frac,
+            'step_count':    [0],     # steps seen via wrapper this generation
         }
+
+        # ── model_function_wrapper: capture real sigma ────────────────────────
+        # ComfyUI's ModelPatcher calls model_function_wrapper as:
+        #   wrapper(apply_model_func, args_dict)
+        # where args_dict["timestep"] is the raw sigma tensor from the sampler.
+        # Note: samplers.py also sets transformer_options["sigmas"] = timestep,
+        # but capturing sigma here at the wrapper level is more direct and
+        # avoids any dict-propagation ambiguity through the model forward chain.
+        def sigma_wrapper(apply_model_func, args_dict):
+            timestep = args_dict.get("timestep", None)
+            if timestep is not None:
+                try:
+                    sig = float(timestep.flatten()[0])
+                    sigma_state['current_sigma'][0] = sig
+                    sigma_state['step_count'][0] += 1
+
+                    # Rolling max/min for regime classification
+                    if sigma_state['sigma_max'][0] is None:
+                        sigma_state['sigma_max'][0] = sig
+                        sigma_state['sigma_min'][0] = sig
+                    else:
+                        sigma_state['sigma_max'][0] = max(sigma_state['sigma_max'][0], sig)
+                        sigma_state['sigma_min'][0] = min(sigma_state['sigma_min'][0], sig)
+                except Exception:
+                    pass
+            return apply_model_func(args_dict["input"], args_dict["timestep"],
+                                    **args_dict.get("c", {}))
+
+        patched.set_model_unet_function_wrapper(sigma_wrapper)
+
+        # ── Store sigma_state on the patched model so downstream nodes ────────
+        # (RicciSentinel) can read it without closure-chain walking.
+        if not hasattr(patched, '_sp_sigma_state'):
+            patched._sp_sigma_state = sigma_state
 
         def make_sigma_hook(blk, block_idx):
             """Wrap block-0 forward to adjust BlockSkip windows based on sigma."""
@@ -1449,69 +1389,40 @@ class ShannonPrimeWanSigmaSwitch:
             def sigma_forward(x, e, freqs, context, context_img_len=257,
                               transformer_options={}):
                 if block_idx == 0:
-                    # ── Sigma source: prefer transformer_options['sigmas'] ──────────────
-                    # e_mag (mean |e|) is NOT a reliable sigma proxy for Wan — the
-                    # timestep embedding projects sigma into a space where magnitudes
-                    # vary < 15% across the full denoising trajectory. We require a
-                    # genuine sigma source (raw float from the sampler) to operate.
-                    # If unavailable, bypass for the entire generation (latched once).
-                    raw_sigma = None
-                    if sigma_state['has_sigmas'][0] is not False:  # don't re-probe after failure
-                        try:
-                            sigs = transformer_options.get('sigmas', None)
-                            if sigs is not None and hasattr(sigs, '__len__') and len(sigs) > 0:
-                                raw_sigma = float(sigs[0])
-                                sigma_state['has_sigmas'][0] = True
-                        except Exception:
-                            pass
-                        if raw_sigma is None and sigma_state['has_sigmas'][0] is None:
-                            # First call, no sigmas — latch bypass for entire generation
-                            sigma_state['has_sigmas'][0] = False
-                            sigma_state['bypassed'][0]   = True
+                    sig_val = sigma_state['current_sigma'][0]
+
+                    if sig_val is None:
+                        # Wrapper hasn't fired yet (shouldn't happen, but be safe)
+                        return orig_forward(x, e, freqs, context,
+                                            context_img_len=context_img_len,
+                                            transformer_options=transformer_options)
+
+                    s_max   = sigma_state['sigma_max'][0]
+                    s_min   = sigma_state['sigma_min'][0]
+                    s_range = s_max - s_min
+
+                    threshold     = s_min + sigma_state['split'] * max(s_range, 1e-6)
+                    is_high_sigma = sig_val >= threshold
+
+                    # Find and adjust BlockSkip state's effective_win
+                    fwd = orig_forward
+                    cell_contents = []
+                    if hasattr(fwd, "__closure__") and fwd.__closure__:
+                        cell_contents = [c.cell_contents for c in fwd.__closure__
+                                         if hasattr(c, "cell_contents")]
+                    for obj in cell_contents:
+                        if isinstance(obj, dict) and "effective_win" in obj:
+                            mult = sigma_state['high_mult'] if is_high_sigma else sigma_state['low_mult']
+                            for blk_i in list(obj["effective_win"].keys()):
+                                nom = 10 if blk_i < 4 else (3 if blk_i < 9 else 0)
+                                if nom > 0:
+                                    new_win = max(1, min(nom * 3, int(nom * mult)))
+                                    obj["effective_win"][blk_i] = new_win
                             if verbose:
-                                print("[SP SigmaSwitch] transformer_options has no 'sigmas' — "
-                                      "bypassing for this generation (nominal windows preserved)")
-
-                    if sigma_state['bypassed'][0]:
-                        # No sigma source — pass through without modifying windows
-                        pass  # fall through to orig_forward call below
-                    else:
-                        sig_val = raw_sigma
-
-                        # Update rolling max/min
-                        if sigma_state['e_mag_max'][0] is None:
-                            sigma_state['e_mag_max'][0] = sig_val
-                            sigma_state['e_mag_min'][0] = sig_val
-                        else:
-                            sigma_state['e_mag_max'][0] = max(sigma_state['e_mag_max'][0], sig_val)
-                            sigma_state['e_mag_min'][0] = min(sigma_state['e_mag_min'][0], sig_val)
-
-                        s_max   = sigma_state['e_mag_max'][0]
-                        s_min   = sigma_state['e_mag_min'][0]
-                        s_range = s_max - s_min
-
-                        threshold     = s_min + sigma_state['split'] * max(s_range, 1e-6)
-                        is_high_sigma = sig_val >= threshold
-
-                        # Find and adjust BlockSkip state's effective_win
-                        fwd = orig_forward
-                        cell_contents = []
-                        if hasattr(fwd, "__closure__") and fwd.__closure__:
-                            cell_contents = [c.cell_contents for c in fwd.__closure__
-                                             if hasattr(c, "cell_contents")]
-                        for obj in cell_contents:
-                            if isinstance(obj, dict) and "effective_win" in obj:
-                                mult = sigma_state['high_mult'] if is_high_sigma else sigma_state['low_mult']
-                                for blk_i in list(obj["effective_win"].keys()):
-                                    nom = 10 if blk_i < 4 else (3 if blk_i < 9 else 0)
-                                    if nom > 0:
-                                        new_win = max(1, min(nom * 3, int(nom * mult)))
-                                        obj["effective_win"][blk_i] = new_win
-                                if verbose:
-                                    mode = "HIGH" if is_high_sigma else "LOW "
-                                    print(f"[SP SigmaSwitch] {mode} σ={sig_val:.4f} "
-                                          f"thr={threshold:.4f} "
-                                          f"win[0]={obj['effective_win'].get(0,'?')}")
+                                mode = "HIGH" if is_high_sigma else "LOW "
+                                print(f"[SP SigmaSwitch] {mode} σ={sig_val:.4f} "
+                                      f"thr={threshold:.4f} "
+                                      f"win[0]={obj['effective_win'].get(0,'?')}")
 
                 return orig_forward(x, e, freqs, context,
                                     context_img_len=context_img_len,
@@ -1523,9 +1434,9 @@ class ShannonPrimeWanSigmaSwitch:
         blk0 = blocks[0][1]
         blk0.forward = make_sigma_hook(blk0, 0)
 
-        print(f"[SP SigmaSwitch] attached to block-0 | "
+        print(f"[SP SigmaSwitch] attached via model_function_wrapper (real sigma) | "
               f"high_sigma_mult={high_sigma_mult}x low_sigma_mult={low_sigma_mult}x "
-              f"split@{sigma_split_frac:.0%} of e_mag range")
+              f"split@{sigma_split_frac:.0%}")
 
         return (patched,)
 
@@ -1536,20 +1447,20 @@ class ShannonPrimeWanRicciSentinel:
 
     Attach after BlockSkip + SigmaSwitch. Hooks block-0 forward and records
     each denoising step's sigma regime and cache window decisions. At each
-    generation boundary (wall-clock gap > 5s), prints a compact table showing
+    generation boundary (wall-clock gap > 60s), prints a compact table showing
     the full timeline so you can verify SigmaSwitch is doing the right thing.
 
     Output columns:
       Step   — denoising step number within this generation
-      e_mag  — timestep embedding magnitude (sigma proxy)
+      sigma  — real sigma from sampler (via SigmaSwitch's model_function_wrapper)
       regime — HIGH (early/Arithmetic Granite) or LOW (late/Semantic Sand)
       win[0] — effective_win for block 0 (Tier-0 representative)
       win[4] — effective_win for block 4 (Tier-1 representative)
       roll_sim[0] — rolling cosine similarity oracle for block 0
 
-    Mechanism: recursively walks block-0's closure chain to find BlockSkip's
-    shared `state` dict (identified by the 'effective_win' key), then reads
-    the per-block window decisions written by SigmaSwitch.
+    Sigma source: reads from patched._sp_sigma_state (set by SigmaSwitch's
+    model_function_wrapper). Falls back to e_mag if SigmaSwitch is not in
+    the chain (e_mag is unreliable for Wan but better than nothing for diag).
 
     Workflow: ... → ShannonPrimeWanBlockSkip → ShannonPrimeWanSigmaSwitch
                  → ShannonPrimeWanRicciSentinel → KSampler → ...
@@ -1591,12 +1502,20 @@ class ShannonPrimeWanRicciSentinel:
             print("[SP Ricci] no Wan blocks found — passing through")
             return (patched,)
 
+        # ── Try to read real sigma from SigmaSwitch's model_function_wrapper ──
+        sp_sigma = getattr(patched, '_sp_sigma_state', None)
+        has_real_sigma = sp_sigma is not None
+        if has_real_sigma:
+            print("[SP Ricci Sentinel] found _sp_sigma_state — using real sigma from sampler")
+        else:
+            print("[SP Ricci Sentinel] no _sp_sigma_state — falling back to e_mag (unreliable for Wan)")
+
         sentinel = {
-            'log':       [],       # list of per-step record dicts
-            'e_mag_max': [None],   # rolling max e_mag for this generation
-            'e_mag_min': [None],   # rolling min e_mag for this generation
-            'last_t':    [0.0],    # wall-clock time of last block-0 call
-            'split':     sigma_split_frac,
+            'log':        [],       # list of per-step record dicts
+            'sigma_max':  [None],   # rolling max sigma for this generation
+            'sigma_min':  [None],   # rolling min sigma for this generation
+            'last_t':     [0.0],    # wall-clock time of last block-0 call
+            'split':      sigma_split_frac,
         }
 
         def _find_state(fwd, key, depth=0):
@@ -1627,8 +1546,9 @@ class ShannonPrimeWanRicciSentinel:
                 _w = _tqdm.tqdm.write
             except Exception:
                 _w = print
+            src_label = "sigma" if has_real_sigma else "e_mag"
             _w(f"\n[SP Ricci Sentinel] Generation summary ({len(log)} steps):")
-            _w(f"  {'Step':>4s}  {'e_mag':>7s}  {'regime':6s}  "
+            _w(f"  {'Step':>4s}  {src_label:>7s}  {'regime':6s}  "
                f"{'win[0]':>6s}  {'win[4]':>6s}  {'roll_sim[0]':>11s}")
             _w("  " + "-" * 54)
             last_regime = None
@@ -1640,12 +1560,12 @@ class ShannonPrimeWanRicciSentinel:
                     arrow = "HIGH->LOW" if last_regime == "HIGH" else "LOW->HIGH"
                     _w(f"  {'':4s}  {'--- ' + arrow + ' ---':>40s}")
                 rs0 = f"{rec['roll_sim0']:.3f}" if rec['roll_sim0'] is not None else "   n/a"
-                _w(f"  {rec['step']:4d}  {rec['e_mag']:7.3f}  {regime:6s}  "
+                _w(f"  {rec['step']:4d}  {rec['sigma']:7.3f}  {regime:6s}  "
                    f"{rec['win0']:6d}  {rec['win4']:6d}  {rs0:>11s}")
                 last_regime = regime
             if switch_step is not None:
                 _w(f"\n  Regime switch at step {switch_step} "
-                   f"(split@{sentinel['split']:.0%} of e_mag range)")
+                   f"(split@{sentinel['split']:.0%} of sigma range)")
             else:
                 _w(f"\n  No regime switch (all steps in one regime)")
             _w("")
@@ -1663,30 +1583,33 @@ class ShannonPrimeWanRicciSentinel:
             if sentinel['last_t'][0] > 0 and t_gap > 60.0:
                 _print_log(sentinel['log'])
                 sentinel['log'].clear()
-                sentinel['e_mag_max'][0] = None
-                sentinel['e_mag_min'][0] = None
+                sentinel['sigma_max'][0] = None
+                sentinel['sigma_min'][0] = None
 
             sentinel['last_t'][0] = now
 
-            # ── Read current e_mag ─────────────────────────────────────────────
-            e_mag = float(e.float().reshape(-1).abs().mean())
+            # ── Read current sigma ─────────────────────────────────────────────
+            # Prefer real sigma from SigmaSwitch; fall back to e_mag.
+            if has_real_sigma and sp_sigma['current_sigma'][0] is not None:
+                sig_val = sp_sigma['current_sigma'][0]
+            else:
+                # Fallback: e_mag (unreliable for Wan, <15% dynamic range)
+                sig_val = float(e.float().reshape(-1).abs().mean())
 
             # Update rolling range
-            if sentinel['e_mag_max'][0] is None:
-                sentinel['e_mag_max'][0] = e_mag
-                sentinel['e_mag_min'][0] = e_mag
+            if sentinel['sigma_max'][0] is None:
+                sentinel['sigma_max'][0] = sig_val
+                sentinel['sigma_min'][0] = sig_val
             else:
-                sentinel['e_mag_max'][0] = max(sentinel['e_mag_max'][0], e_mag)
-                sentinel['e_mag_min'][0] = min(sentinel['e_mag_min'][0], e_mag)
+                sentinel['sigma_max'][0] = max(sentinel['sigma_max'][0], sig_val)
+                sentinel['sigma_min'][0] = min(sentinel['sigma_min'][0], sig_val)
 
-            e_max     = sentinel['e_mag_max'][0]
-            e_min     = sentinel['e_mag_min'][0]
-            threshold = e_min + sentinel['split'] * max(e_max - e_min, 1e-6)
-            is_high   = e_mag >= threshold
+            s_max     = sentinel['sigma_max'][0]
+            s_min     = sentinel['sigma_min'][0]
+            threshold = s_min + sentinel['split'] * max(s_max - s_min, 1e-6)
+            is_high   = sig_val >= threshold
 
             # ── Read BlockSkip state (effective_win, rolling_sim) ─────────────
-            # Walk the closure chain: sentinel_forward -> orig_fwd (SigmaSwitch or
-            # BlockSkip) -> nested closures until we find the 'effective_win' dict.
             bs_state = _find_state(orig_fwd, "effective_win")
             step_no  = len(sentinel['log']) + 1
             win0     = bs_state['effective_win'].get(0, -1) if bs_state else -1
@@ -1695,7 +1618,7 @@ class ShannonPrimeWanRicciSentinel:
 
             rec = {
                 'step':      step_no,
-                'e_mag':     e_mag,
+                'sigma':     sig_val,
                 'high':      is_high,
                 'win0':      win0,
                 'win4':      win4,
@@ -1710,9 +1633,10 @@ class ShannonPrimeWanRicciSentinel:
                 except Exception:
                     _write = print
                 regime = "HIGH" if is_high else "LOW "
+                src    = "σ" if has_real_sigma else "e"
                 rs_str = f"sim={rs0:.3f}" if rs0 is not None else ""
-                _write(f"[SP Ricci] step={step_no:3d}  e={e_mag:.3f}  "
-                       f"thr={threshold:.3f}  {regime}  "
+                _write(f"[SP Ricci] step={step_no:3d}  {src}={sig_val:.4f}  "
+                       f"thr={threshold:.4f}  {regime}  "
                        f"win[0]={win0}  win[4]={win4}  {rs_str}")
 
             return orig_fwd(x, e, freqs, context,
@@ -1721,10 +1645,11 @@ class ShannonPrimeWanRicciSentinel:
 
         blk0.forward = sentinel_forward
 
+        src_str = "real sigma (model_function_wrapper)" if has_real_sigma else "e_mag fallback"
         print(f"[SP Ricci Sentinel] attached to block-0 | "
-              f"split@{sigma_split_frac:.0%} | verbose={verbose}")
-        print(f"[SP Ricci Sentinel] timeline table printed at each generation boundary (t_gap>5s)")
-        print(f"[SP Ricci Sentinel] columns: step | e_mag | HIGH/LOW | win[0] | win[4] | roll_sim[0]")
+              f"source={src_str} | split@{sigma_split_frac:.0%} | verbose={verbose}")
+        print(f"[SP Ricci Sentinel] timeline table printed at each generation boundary (t_gap>60s)")
+        print(f"[SP Ricci Sentinel] columns: step | sigma | HIGH/LOW | win[0] | win[4] | roll_sim[0]")
 
         return (patched,)
 
@@ -1734,7 +1659,6 @@ NODE_CLASS_MAPPINGS = {
     "ShannonPrimeWanCacheStats":      ShannonPrimeWanCacheStats,
     "ShannonPrimeWanCacheSqfree":     ShannonPrimeWanCacheSqfree,
     "ShannonPrimeWanSelfExtract":     ShannonPrimeWanSelfExtract,
-    "ShannonPrimeWanBlockCache":      ShannonPrimeWanBlockCache,
     "ShannonPrimeWanBlockSkip":       ShannonPrimeWanBlockSkip,
     "ShannonPrimeWanCacheFlush":      ShannonPrimeWanCacheFlush,
     "ShannonPrimeWanSigmaSwitch":     ShannonPrimeWanSigmaSwitch,
@@ -1746,8 +1670,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ShannonPrimeWanCacheStats":      "Shannon-Prime: Cache Stats",
     "ShannonPrimeWanCacheSqfree":     "Shannon-Prime: Wan Cross-Attn Cache (Sqfree)",
     "ShannonPrimeWanSelfExtract":     "Shannon-Prime: Wan Self-Attn Extract (Phase 12)",
-    "ShannonPrimeWanBlockCache":      "Shannon-Prime: Wan Block-Tier Self-Attn Cache",
-    "ShannonPrimeWanBlockSkip":       "Shannon-Prime: Wan Block-Level Self-Attn Skip",
+    "ShannonPrimeWanBlockSkip":       "Shannon-Prime: Wan Block-Level Self-Attn Skip (VHT2)",
     "ShannonPrimeWanCacheFlush":      "Shannon-Prime: Wan Block Cache Flush (before VAE)",
     "ShannonPrimeWanSigmaSwitch":     "Shannon-Prime: Wan Sigma Switch (Phase 13)",
     "ShannonPrimeWanRicciSentinel":   "Shannon-Prime: Wan Ricci Sentinel (Phase 13 diag)",
