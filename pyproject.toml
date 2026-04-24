@@ -3,7 +3,6 @@ name = "shannon-prime-comfyui"
 version = "1.0.0"
 description = "Shannon-Prime VHT2 cross-attention caching for ComfyUI video generation"
 license = { text = "AGPL-3.0" }
-urls = { Repository = "https://github.com/nihilistau/shannon-prime-comfyui" }
 
 [project.urls]
 Repository = "https://github.com/nihilistau/shannon-prime-comfyui"

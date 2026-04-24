@@ -33,6 +33,6 @@ try:
             pass
         return web.json_response({"status": "ok", "source": "sp_cleanup"})
 
-    print("[Shannon-Prime] /sp/cleanup endpoint registered (cancel → unload + empty_cache)")
+    print("[Shannon-Prime] /sp/cleanup endpoint registered (cancel -> unload + empty_cache)")
 except Exception as _e:
     print(f"[Shannon-Prime] /sp/cleanup not registered: {_e}")
