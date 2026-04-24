@@ -862,13 +862,14 @@ class ShannonPrimeWanBlockSkip:
                 "drift_threshold": ("FLOAT", {"default": 0.85, "min": 0.50, "max": 0.99,
                     "step": 0.01,
                     "tooltip": "Rolling cos_sim below this halves the cache window (Mertens Oracle)"}),
-                "x_drift_t0": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                "x_drift_t0": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0,
                     "step": 0.05,
                     "tooltip": (
-                        "x-drift threshold for Tier-0 blocks (L00-L03, Permanent Granite). "
-                        "Default 0.0 = DISABLED (trust the rolling-sim oracle alone — "
-                        "these blocks are stable and the oracle handles them correctly). "
-                        "Raise to 0.30-0.40 only if you see video composition instability."
+                        "x-drift threshold for Tier-0 blocks (L00-L03). "
+                        "0.30 catches 'floor drop' events (sudden latent jumps) "
+                        "without over-triggering on normal per-step variation (0.10-0.25). "
+                        "Combine with streak-miss (every 5 hits) for warp-free output. "
+                        "0.0 = disabled (fast but risks composition warping on some prompts)."
                     )}),
                 "x_drift_t1": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0,
                     "step": 0.05,
@@ -887,7 +888,7 @@ class ShannonPrimeWanBlockSkip:
 
     def patch(self, model, tier_0_window=10, tier_1_window=3,
               drift_threshold=0.85,
-              x_drift_t0=0.0, x_drift_t1=0.25,
+              x_drift_t0=0.30, x_drift_t1=0.25,
               verbose=False):
         import types
         import comfy.model_management
@@ -920,9 +921,16 @@ class ShannonPrimeWanBlockSkip:
                 return tier_1_window
             return 0
 
+        # Max consecutive hits before forcing a miss to update the oracle.
+        # The rolling oracle only updates on misses — without a forced miss, a
+        # streak of perfect hits masks a sudden y-drift (seen as warping at step 10).
+        # Default 5: force a miss every 5 hits regardless of window.
+        max_streak = 5  # hardcoded; could be a parameter if needed
+
         # Shared state across all patched blocks
         state = {
             'global_step':    [0],      # step counter (incremented by block-0)
+            'hit_streak':     {},       # block_idx -> consecutive cache-hit count
             'attn_cache':     {},       # block_idx -> y tensor (CPU)
             'step_cached':    {},       # block_idx -> step at which y was cached
             'rolling_sim':    {},       # block_idx -> float (recent cos_sim)
@@ -997,7 +1005,19 @@ class ShannonPrimeWanBlockSkip:
                                   f" -> forced miss, win halved to "
                                   f"{state['effective_win'][block_idx]}")
 
-                if (not x_drift_forced_miss
+                # Force a miss after max_streak consecutive hits so the oracle
+                # can observe the current y and update rolling_sim.
+                # Without this, a perfect-sim hit streak masks a sudden y-drift.
+                streak = state['hit_streak'].get(block_idx, 0)
+                streak_forced_miss = (eff_win > 0 and streak >= max_streak
+                                      and block_idx in state['attn_cache'])
+                if streak_forced_miss:
+                    state['hit_streak'][block_idx] = 0   # reset counter
+                    if verbose:
+                        print(f"[SP BlockSkip] B{block_idx:02d} STREAK-MISS "
+                              f"step={step} streak={streak}>={max_streak} -> oracle refresh")
+
+                if (not x_drift_forced_miss and not streak_forced_miss
                         and eff_win > 0
                         and age < eff_win
                         and block_idx in state['attn_cache']):
@@ -1006,9 +1026,11 @@ class ShannonPrimeWanBlockSkip:
                                                           dtype=x.dtype)
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
+                    state['hit_streak'][block_idx] = state['hit_streak'].get(block_idx, 0) + 1
                     if verbose:
+                        streak_now = state['hit_streak'].get(block_idx, 0)
                         print(f"[SP BlockSkip] B{block_idx:02d} HIT  "
-                              f"step={step} age={age}/{eff_win} "
+                              f"step={step} age={age}/{eff_win} streak={streak_now}/{max_streak} "
                               f"sim={state['rolling_sim'].get(block_idx, 1):.3f}")
                 else:
                     # ── CACHE MISS: run self-attention ─────────────────────────
@@ -1062,7 +1084,8 @@ class ShannonPrimeWanBlockSkip:
                     except Exception:
                         state['attn_cache'][block_idx]   = y.detach().cpu()
                         state['x_ref'][block_idx]        = x.detach().cpu()
-                    state['step_cached'][block_idx] = step
+                    state['step_cached'][block_idx]  = step
+                    state['hit_streak'][block_idx]   = 0   # reset on miss
 
                     x = torch.addcmul(x, y, repeat_e(e_mods[2], x))
                     del y
