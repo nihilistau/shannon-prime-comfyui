@@ -1222,6 +1222,20 @@ class ShannonPrimeWanBlockSkip:
               f"T1={x_drift_t1}  (0.0=disabled, trust oracle)")
         print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
               f"(~50% compute for patched blocks)")
+        # ── Settings summary for this run ──────────────────────────────────────
+        try:
+            _head_dim = next(
+                (getattr(blk, 'self_attn', None) for _, blk in blocks if
+                 getattr(blk, 'self_attn', None) is not None), None
+            )
+            print(f"[SP BlockSkip] ── Run settings ──────────────────────────────────────────")
+            print(f"[SP BlockSkip]   blocks={n_blocks}  tier0_win={tier_0_window}  tier1_win={tier_1_window}")
+            print(f"[SP BlockSkip]   drift_thr={drift_threshold}  x_drift_t0={x_drift_t0}  x_drift_t1={x_drift_t1}")
+            print(f"[SP BlockSkip]   verbose={verbose}  max_streak=5  (hardcoded)")
+        except Exception:
+            pass
+        print(f"[SP BlockSkip] Savings: self-attn Q+K+V+scores skipped on cache hits "
+              f"(~50% compute for patched blocks)")
 
         return (patched,)
 
