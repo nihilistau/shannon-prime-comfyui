@@ -15,4 +15,15 @@ try:
 except ImportError as e:
     print(f"[Shannon-Prime] Flux nodes not loaded: {e}")
 
+# ── Audio DiT nodes (Stable Audio, etc.) ──
+try:
+    from .shannon_prime_audio_nodes import (
+        NODE_CLASS_MAPPINGS as _AUDIO_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _AUDIO_NAMES,
+    )
+    NODE_CLASS_MAPPINGS.update(_AUDIO_CLASSES)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_AUDIO_NAMES)
+except ImportError as e:
+    print(f"[Shannon-Prime] Audio nodes not loaded: {e}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
