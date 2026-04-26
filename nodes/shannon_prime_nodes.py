@@ -1049,6 +1049,19 @@ class ShannonPrimeWanBlockSkip:
                 # are handled by sigma_max/sigma_min rolling min/max.
                 "enable_sigma_streak": ("BOOLEAN", {"default": False,
                     "tooltip": "Strange-attractor stack: streak limits scale with sigma. Granite extends 7-15, sand 4-9, jazz 3-6 across sigma range. OFF = current static 10/5/3 behavior."}),
+                # Piece 3/4: twin-prime borrowing on decode path. After Möbius reorder
+                # and skeleton extraction, twin-prime spectral coefficients (3-5,
+                # 11-13, 17-19, ...) are arithmetic neighbors. When dequantized
+                # values disagree past a threshold, weighted-average pulls outliers
+                # back toward consensus. Decode-only — encoded skeleton bytes are
+                # untouched, reversibility property of compress() unchanged.
+                # Worst case at α=0 = identity. Only applies when cache_compress=vht2.
+                "enable_twin_borrow": ("BOOLEAN", {"default": False,
+                    "tooltip": "Strange-attractor stack: twin-prime borrowing on VHT2 decode. 9 disjoint pairs at head_dim=128 (3-5, 11-13, 17-19, 29-31, ...). Only takes effect when cache_compress=vht2."}),
+                "twin_alpha": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "tooltip": "Borrow strength. 0=no change, 0.5=full pair average. Bounded change: |Δc| ≤ α/2·|c_i-c_j|."}),
+                "twin_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1065,6 +1078,7 @@ class ShannonPrimeWanBlockSkip:
               enable_drift_gate=False,
               granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
               enable_sigma_streak=False,
+              enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1359,6 +1373,12 @@ class ShannonPrimeWanBlockSkip:
                             full = torch.zeros(t.shape[0], _head_dim,
                                                dtype=torch.float32)
                             full[:, _skel_mask] = t.float()
+                            # Strange-attractor stack piece 3/4: twin-prime borrow
+                            # before the inverse butterfly (decode-only).
+                            if enable_twin_borrow:
+                                full = _vht2_bridge.apply_twin_borrow(
+                                    full, _skel_mask,
+                                    alpha=twin_alpha, threshold=twin_threshold)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
                         except Exception:
@@ -1521,6 +1541,12 @@ class ShannonPrimeWanBlockSkip:
             src = "own wrapper" if owns_wrapper else "SigmaSwitch upstream"
             print(f"[SP BlockSkip] Sigma-streak ON: granite 7-15, sand 4-9, jazz 3-6 "
                   f"across sigma range (sigma source: {src})")
+        if enable_twin_borrow:
+            if _use_vht2:
+                print(f"[SP BlockSkip] Twin-prime borrow ON: α={twin_alpha:.2f} "
+                      f"threshold={twin_threshold:.2f} (decode-only, 9 disjoint pairs)")
+            else:
+                print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
