@@ -1129,6 +1129,16 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Force a miss when rolling_sim acceleration goes below curvature_threshold (sim is rapidly accelerating downward). Layered on top of the static drift gate."}),
                 "curvature_threshold": ("FLOAT", {"default": -0.05, "min": -0.30, "max": 0.0, "step": 0.01,
                     "tooltip": "Min acceleration. -0.05 = sim's rate-of-decline jumped by 5pp between miss steps."}),
+                # ── v2 piece 5/7: Cauchy reset hook ──────────────────────
+                # When a block's drift/curvature gate forces a miss, the
+                # trajectory has escaped the basin near that block. Likely
+                # the same is happening for nearby same-tier blocks. Invalidate
+                # them too so they refresh together on the next step rather
+                # than each one tripping its own gate one-by-one.
+                "enable_cauchy_reset": ("BOOLEAN", {"default": False,
+                    "tooltip": "When a drift- or curvature-induced miss fires, also invalidate ±cauchy_radius neighbor blocks within the same tier."}),
+                "cauchy_radius": ("INT", {"default": 2, "min": 0, "max": 10,
+                    "tooltip": "Block-index radius for the reset. 0=no neighbors, 2=±2 same-tier neighbors, etc."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1151,6 +1161,7 @@ class ShannonPrimeWanBlockSkip:
               enable_tier_skeleton=False,
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
               enable_curvature_gate=False, curvature_threshold=-0.05,
+              enable_cauchy_reset=False, cauchy_radius=2,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1297,6 +1308,34 @@ class ShannonPrimeWanBlockSkip:
             if i < 9:
                 return sand_threshold
             return jazz_threshold
+
+        # ── v2 piece 5/7: Cauchy reset helper ────────────────────────────
+        # When a drift/curvature gate forces a miss on block triggering, also
+        # invalidate cached state for ±cauchy_radius neighbors within the same
+        # tier so they refresh together on the next step. Same-tier check uses
+        # the {0..3, 4..8, 9..15, 16..} bands as elsewhere.
+        def _cauchy_reset(triggering, st):
+            if triggering < 4:
+                tier_lo, tier_hi = 0, 3
+            elif triggering < 9:
+                tier_lo, tier_hi = 4, 8
+            elif triggering < 16:
+                tier_lo, tier_hi = 9, 15
+            else:
+                tier_lo, tier_hi = 16, 9999
+            lo = max(triggering - cauchy_radius, tier_lo)
+            hi = min(triggering + cauchy_radius, tier_hi)
+            cleared = 0
+            for bi in range(lo, hi + 1):
+                if bi == triggering:
+                    continue
+                for k in ('attn_cache', 'xattn_cache', 'ffn_cache',
+                          'prev_attn_cache', 'step_cached', 'hit_streak',
+                          'rolling_sim', 'delta_sim', 'curvature_violation'):
+                    if bi in st.get(k, {}):
+                        st[k].pop(bi, None)
+                        cleared += 1
+            return cleared
 
         # ── Sigma capture (cooperative with ShannonPrimeWanSigmaSwitch) ──
         # If SigmaSwitch is upstream it has already populated _sp_sigma_state
@@ -1448,6 +1487,20 @@ class ShannonPrimeWanBlockSkip:
 
                 # ── CACHE HIT ──────────────────────────────────────────────
                 _streak_limit = _current_streak_limit()
+                # Detect a "would have hit but for the gates" — that's the
+                # signal for a Cauchy reset to fire (real basin escape, not
+                # just window/streak expiry).
+                gate_forced_miss = (cached_y is not None
+                                    and cached_xa is not None
+                                    and age >= 0 and age < window
+                                    and streak < _streak_limit
+                                    and not (drift_ok and curvature_ok))
+                if enable_cauchy_reset and gate_forced_miss and cauchy_radius > 0:
+                    n_cleared = _cauchy_reset(block_idx, state)
+                    if verbose and n_cleared > 0:
+                        print(f"[SP BlockSkip] B{block_idx:02d} CAUCHY RESET — "
+                              f"cleared {n_cleared} state entries on neighbors")
+
                 hit = (cached_y is not None
                        and cached_xa is not None
                        and age >= 0 and age < window
@@ -1715,6 +1768,9 @@ class ShannonPrimeWanBlockSkip:
         if enable_curvature_gate:
             print(f"[SP BlockSkip] Curvature gate ON: threshold={curvature_threshold:+.3f} "
                   f"(force miss when sim acceleration drops below)")
+        if enable_cauchy_reset:
+            print(f"[SP BlockSkip] Cauchy reset ON: radius={cauchy_radius} "
+                  f"(invalidate ±{cauchy_radius} same-tier neighbors on gated miss)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
