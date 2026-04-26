@@ -402,68 +402,120 @@ def _tiered_lattice_factors(n_freqs, freq_base=10000.0, alpha=0.17, tier='auto')
 
 def _install_lattice_rope(alpha=0.17):
     """
-    Monkey-patch comfy's Wan get_1d_rotary_pos_embed to use factored
-    lattice frequencies. Idempotent — safe to call multiple times.
+    Install factored 3D lattice RoPE. Tries the legacy module-level API
+    first (older ComfyUI versions exposed get_1d_rotary_pos_embed), then
+    falls back to patching EmbedND.forward (new API where rope is a
+    per-axis call inside an nn.Module). Idempotent.
 
-    Returns True if patching succeeded, False if Wan model not available.
+    Returns True if patching succeeded, False if neither path is available.
+
+    v2 piece 6/7: revived for current ComfyUI which removed the legacy
+    module-level helper. Math (_tiered_lattice_factors) is unchanged;
+    only the patching mechanism is updated.
     """
+    # ── Path A: legacy module-level API (older ComfyUI) ──────────────
     try:
         import comfy.ldm.wan.model as wan_model
     except ImportError:
         return False
 
-    # Don't double-patch
     if getattr(wan_model, '_sp_lattice_patched', False):
         return True
 
-    _orig_get_1d = wan_model.get_1d_rotary_pos_embed
+    if hasattr(wan_model, 'get_1d_rotary_pos_embed'):
+        _orig_get_1d = wan_model.get_1d_rotary_pos_embed
 
-    def _lattice_get_1d_rotary_pos_embed(dim, pos, theta=10000.0, **kwargs):
-        """
-        Drop-in replacement that blends lattice frequencies into Wan's
-        per-axis RoPE. Uses the dim hint to decide tier:
-          dim <= 48: likely temporal → Long-Tier
-          dim > 48:  likely spatial  → Local-Tier
+        def _lattice_get_1d_rotary_pos_embed(dim, pos, theta=10000.0, **kwargs):
+            n_freqs = dim // 2
+            tier = 'long' if dim >= 48 else 'local'
+            factors = _tiered_lattice_factors(n_freqs, freq_base=theta,
+                                              alpha=alpha, tier=tier)
+            freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            freqs = freqs * factors
+            t = (torch.arange(pos, dtype=freqs.dtype) if isinstance(pos, int)
+                 else torch.tensor(pos, dtype=freqs.dtype)
+                 if not isinstance(pos, torch.Tensor) else pos.float())
+            freqs_outer = torch.outer(t, freqs)
+            return torch.cat([freqs_outer.cos(), freqs_outer.sin()], dim=-1)
 
-        The blended frequencies are applied via freq_factors on the
-        geometric baseline — same mechanism as sp_inject_freqs.py.
-        """
-        n_freqs = dim // 2
+        wan_model.get_1d_rotary_pos_embed = _lattice_get_1d_rotary_pos_embed
+        wan_model._sp_lattice_patched = True
+        print(f"[Shannon-Prime] Lattice RoPE installed (legacy API, α={alpha})")
+        print(f"[Shannon-Prime]   Temporal → Long-Tier, Spatial → Local-Tier")
+        return True
 
-        # Determine tier from dimension:
-        # Wan 2.2 5B: d_t=48, d_h=40, d_w=40 (total 128)
-        # Temporal dim is typically the largest per-axis allocation
-        if dim >= 48:
-            tier = 'long'    # temporal: causal anchors
-        else:
-            tier = 'local'   # spatial: fine detail
+    # ── Path B: new API — patch comfy.ldm.flux.layers.EmbedND.forward ─
+    # WanModel uses EmbedND(dim=d, theta, axes_dim=[d-4*(d//6), 2*(d//6), 2*(d//6)]).
+    # axes_dim[0] is temporal (largest), [1]/[2] are spatial (equal). EmbedND.forward
+    # iterates axes and calls rope(ids[..., i], axes_dim[i], theta).
+    #
+    # We replace the forward to inject per-axis lattice factors on the omega.
+    try:
+        from comfy.ldm.flux import layers as flux_layers
+        from comfy.ldm.flux.math import rope as orig_rope
+    except ImportError:
+        print("[Shannon-Prime] Lattice RoPE: neither legacy nor new API available")
+        return False
 
-        factors = _tiered_lattice_factors(n_freqs, freq_base=theta,
-                                          alpha=alpha, tier=tier)
+    if getattr(flux_layers.EmbedND, '_sp_lattice_patched', False):
+        wan_model._sp_lattice_patched = True
+        return True
 
-        # Modify theta per-dim: effective_theta[j] = theta / factor[j]
-        # This is equivalent to applying freq_factors in ggml_rope_ext
-        import types
-        import functools
+    _orig_embedND_forward = flux_layers.EmbedND.forward
 
-        # Call original but with modified frequencies
-        # The cleanest path: compute the embedding ourselves using the
-        # blended frequencies, matching the original's output format.
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        freqs = freqs * factors  # apply lattice blend
+    # Cache for per-(dim, theta, tier) factor tensors
+    _lattice_factor_cache = {}
 
-        t = torch.arange(pos, dtype=freqs.dtype) if isinstance(pos, int) \
-            else torch.tensor(pos, dtype=freqs.dtype) if not isinstance(pos, torch.Tensor) \
-            else pos.float()
+    def _get_factors(dim, theta, tier):
+        key = (int(dim), float(theta), tier, float(alpha))
+        f = _lattice_factor_cache.get(key)
+        if f is None:
+            n_freqs = dim // 2
+            f = _tiered_lattice_factors(n_freqs, freq_base=theta,
+                                        alpha=alpha, tier=tier)
+            _lattice_factor_cache[key] = f
+        return f
 
-        freqs_outer = torch.outer(t, freqs)
-        emb = torch.cat([freqs_outer.cos(), freqs_outer.sin()], dim=-1)
-        return emb
+    def _lattice_embedND_forward(self, ids):
+        # ids shape: [..., n_axes]. n_axes = 3 for Wan 3D RoPE, 2 for Flux 2D.
+        n_axes = ids.shape[-1]
+        embs = []
+        device = ids.device
+        for i in range(n_axes):
+            axis_dim = self.axes_dim[i]
+            # Tier routing: 3D → axis 0 = temporal (long), 1/2 = spatial (local).
+            # 2D (Flux) → both axes = local. 1D → auto.
+            if n_axes == 3:
+                tier = 'long' if i == 0 else 'local'
+            elif n_axes == 2:
+                tier = 'local'
+            else:
+                tier = 'auto'
 
-    wan_model.get_1d_rotary_pos_embed = _lattice_get_1d_rotary_pos_embed
+            factors = _get_factors(axis_dim, self.theta, tier).to(device)
+            # Reproduce flux.math.rope with omega multiplied by lattice factors:
+            # omega = 1/theta**scale  →  omega_lattice = omega * factors
+            scale = torch.linspace(0, (axis_dim - 2) / axis_dim,
+                                   steps=axis_dim // 2,
+                                   dtype=torch.float64, device=device)
+            omega = (1.0 / (self.theta ** scale)).to(torch.float64) * factors.to(torch.float64)
+            pos_axis = ids[..., i].to(torch.float32)
+            out = torch.einsum("...n,d->...nd", pos_axis, omega.to(torch.float32))
+            out = torch.stack([torch.cos(out), -torch.sin(out),
+                               torch.sin(out),  torch.cos(out)], dim=-1)
+            # Reshape (..., n, d, 4) → (..., n, d, 2, 2) to match original rope output
+            new_shape = out.shape[:-1] + (2, 2)
+            out = out.reshape(*new_shape).to(torch.float32)
+            embs.append(out)
+
+        return torch.cat(embs, dim=-3).unsqueeze(1)
+
+    flux_layers.EmbedND.forward = _lattice_embedND_forward
+    flux_layers.EmbedND._sp_lattice_patched = True
     wan_model._sp_lattice_patched = True
-    print(f"[Shannon-Prime] Factored 3D Lattice RoPE installed (α={alpha})")
-    print(f"[Shannon-Prime]   Temporal → Long-Tier, Spatial → Local-Tier")
+    print(f"[Shannon-Prime] Lattice RoPE installed (EmbedND API, α={alpha})")
+    print(f"[Shannon-Prime]   3D: temporal → Long-Tier, spatial → Local-Tier")
+    print(f"[Shannon-Prime]   2D: both axes → Local-Tier (Flux compatible)")
     return True
 
 
