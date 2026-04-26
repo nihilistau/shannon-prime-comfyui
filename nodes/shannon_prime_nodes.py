@@ -1092,6 +1092,17 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Borrow strength. 0=no change, 0.5=full pair average. Bounded change: |Δc| ≤ α/2·|c_i-c_j|."}),
                 "twin_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
+                # ── v2 piece 1/5: harmonic correction on cache hits ──────
+                # Sally as harmonic oscillator near equilibrium: when input
+                # drift is small the trajectory is approximately linear, so a
+                # cache hit can be corrected by extrapolating along the last
+                # observed (curr - prev) velocity. y_hit = y_curr + (age/window)
+                # * strength * (y_curr - y_prev). Costs one extra cached y per
+                # block. At strength=0 this is identity (current behavior).
+                "enable_harmonic_correction": ("BOOLEAN", {"default": False,
+                    "tooltip": "Linearly extrapolate y on cache hit using (y_curr - y_prev) velocity. Costs ~2× BlockSkip cache memory when on."}),
+                "harmonic_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05,
+                    "tooltip": "Strength of the linear correction. 0=no correction (identity), 0.5=conservative half-step, 1.0=full extrapolation."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1109,6 +1120,7 @@ class ShannonPrimeWanBlockSkip:
               granite_threshold=0.95, sand_threshold=0.90, jazz_threshold=0.85,
               enable_sigma_streak=False,
               enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
+              enable_harmonic_correction=False, harmonic_strength=0.5,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1146,6 +1158,7 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("ffn_cache", {}).clear()
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
+                            _obj.get("prev_attn_cache", {}).clear()
                             _cleared += 1
                     except ValueError:
                         pass
@@ -1215,6 +1228,7 @@ class ShannonPrimeWanBlockSkip:
             'step_cached':    {},
             'fisher_sim':     {},       # block_idx -> last Fisher cos_sim (diagnostic)
             'rolling_sim':    {},       # block_idx -> EMA of fisher cos_sim across misses
+            'prev_attn_cache':{},       # block_idx -> previous miss's y (for harmonic correction)
         }
 
         # ── Tier-aware drift threshold (strange-attractor stack) ─────────
@@ -1423,6 +1437,23 @@ class ShannonPrimeWanBlockSkip:
                 if hit:
                     # Self-attn: cached pre-gate y + current step's gate
                     y = _load_maybe_vht2(cached_y)
+
+                    # v2 piece 1/5: harmonic correction.
+                    # Linear forward-Euler extrapolation along the (curr - prev)
+                    # velocity, scaled by how far into the cache window we are.
+                    # At age=0 or strength=0 this is identity.
+                    if enable_harmonic_correction and harmonic_strength > 0.0:
+                        prev_y_storage = state['prev_attn_cache'].get(block_idx)
+                        if prev_y_storage is not None and window > 0:
+                            try:
+                                y_prev = _load_maybe_vht2(prev_y_storage)
+                                scale = (age / float(window)) * harmonic_strength
+                                if scale > 0.0:
+                                    y = y + scale * (y - y_prev)
+                                del y_prev
+                            except Exception:
+                                pass  # fail safe — use unmodified y
+
                     x = torch.addcmul(x.contiguous(), y,
                                       repeat_e(e_mods[2], x))
                     del y
@@ -1480,6 +1511,13 @@ class ShannonPrimeWanBlockSkip:
                             state['rolling_sim'][block_idx] = (
                                 0.5 * prev_rolling + 0.5 * f_sim)
                         del prev_on_dev
+
+                    # v2 piece 1/5: capture prev y before overwriting,
+                    # for harmonic correction on subsequent hits.
+                    if enable_harmonic_correction:
+                        prev_storage = state['attn_cache'].get(block_idx)
+                        if prev_storage is not None:
+                            state['prev_attn_cache'][block_idx] = prev_storage
 
                     state['attn_cache'][block_idx] = _store(y)
 
@@ -1582,6 +1620,9 @@ class ShannonPrimeWanBlockSkip:
                       f"threshold={twin_threshold:.2f} (decode-only, 9 disjoint pairs)")
             else:
                 print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
+        if enable_harmonic_correction:
+            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f} "
+                  f"(linear extrapolation, ~2× cache memory)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
@@ -1648,6 +1689,7 @@ class ShannonPrimeWanCacheFlush:
                         obj.get("ffn_cache", {}).clear()
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
+                        obj.get("prev_attn_cache", {}).clear()
                         if n > 0:
                             flushed_blockskip += 1
 
