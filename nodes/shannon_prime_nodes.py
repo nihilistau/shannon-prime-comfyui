@@ -1320,8 +1320,13 @@ class ShannonPrimeWanBlockSkip:
 
                 # ── Print run info on step 1 ────────────────────────────────
                 if block_idx == 0 and step == 1:
+                    # x.dtype is the diffusion latent's compute dtype (Wan locks
+                    # this to fp16 regardless of SP settings). The cache storage
+                    # dtype (fp16/fp8/mixed) is the cache_dtype param and is
+                    # printed in the summary line below.
                     print(f"[SP BlockSkip] step=1 x.shape={tuple(x.shape)}  "
-                          f"tokens={x.shape[1]}  dtype={x.dtype}  device={x.device}")
+                          f"tokens={x.shape[1]}  latent_dtype={x.dtype}  "
+                          f"cache_dtype={cache_dtype}  device={x.device}")
 
                 # ── Recompute adaLN modulation (always — cheap) ─────────────
                 cast = comfy.model_management.cast_to
