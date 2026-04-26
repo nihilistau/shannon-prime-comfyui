@@ -186,30 +186,25 @@ def find_nodes_by_class(workflow: dict, class_type: str) -> list[str]:
             if isinstance(n, dict) and n.get("class_type") == class_type]
 
 
-def parse_csv_int_list(s):
-    """Convert a string like '5,5,4,3' to [5,5,4,3]. Pass through lists."""
-    if isinstance(s, list):
-        return s
-    if isinstance(s, str):
-        return [int(x.strip()) for x in s.split(",") if x.strip()]
-    return s
-
-
 def patch_combo(workflow: dict, target_class: str,
                 params: dict) -> tuple[dict, int]:
     """Deep-copy workflow and apply params to all nodes of target_class.
-    Returns (patched, n_patched)."""
+
+    Values are passed through verbatim. Specifically: csv-style band specs
+    like "5,5,4,3" must stay as STRINGs because ComfyUI's STRING-typed inputs
+    on the Voxtral KV cache reject Python lists (it interprets them as
+    malformed link specs and validation fails with 'Bad linked input, must
+    be a length-2 list of [node_id, slot_index]'). The node parses the
+    string itself.
+
+    Returns (patched, n_patched).
+    """
     wf = copy.deepcopy(workflow)
     targets = find_nodes_by_class(wf, target_class)
     for nid in targets:
         inputs = wf[nid].setdefault("inputs", {})
         for k, v in params.items():
-            # Lists serialize as comma-separated for ComfyUI's INT-list inputs
-            if k in ("k_band_bits", "v_band_bits",
-                     "k_ternary_bands", "v_ternary_bands"):
-                inputs[k] = parse_csv_int_list(v)
-            else:
-                inputs[k] = v
+            inputs[k] = v
     return wf, len(targets)
 
 
