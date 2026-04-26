@@ -1103,6 +1103,20 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Linearly extrapolate y on cache hit using (y_curr - y_prev) velocity. Costs ~2× BlockSkip cache memory when on."}),
                 "harmonic_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05,
                     "tooltip": "Strength of the linear correction. 0=no correction (identity), 0.5=conservative half-step, 1.0=full extrapolation."}),
+                # ── v2 piece 2/7: layer-dependent skeleton fraction ──────
+                # Granite tier sits at cos_sim>0.999 across many steps —
+                # there's room for higher fidelity (more skeleton coefficients
+                # kept). Jazz tier is volatile, can survive more aggressive
+                # pruning. Defaults to uniform 0.30 across all three so
+                # existing behavior is preserved.
+                "enable_tier_skeleton": ("BOOLEAN", {"default": False,
+                    "tooltip": "Use per-tier skeleton fractions for VHT2 compression. Only takes effect when cache_compress=vht2."}),
+                "granite_skel_frac": ("FLOAT", {"default": 0.50, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-0 (L00-L03). Higher = more fidelity. Default 0.50 vs uniform 0.30."}),
+                "sand_skel_frac": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-1 (L04-L08). Default 0.30 = current uniform."}),
+                "jazz_skel_frac": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Skeleton fraction for tier-2/3 (L09+). Lower = more aggressive. Default 0.20 vs uniform 0.30."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1121,6 +1135,8 @@ class ShannonPrimeWanBlockSkip:
               enable_sigma_streak=False,
               enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
               enable_harmonic_correction=False, harmonic_strength=0.5,
+              enable_tier_skeleton=False,
+              granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1203,19 +1219,42 @@ class ShannonPrimeWanBlockSkip:
         _vht2_bridge = None
         _vht2_pool = None
         _skel_mask = None
+        # v2 piece 2/7: per-tier skeleton masks (granite/sand/jazz)
+        _skel_mask_granite = None
+        _skel_mask_sand = None
+        _skel_mask_jazz = None
         if _use_vht2:
             try:
                 from vht2_cuda_bridge import VHT2Bridge
                 _vht2_bridge = VHT2Bridge(skeleton_frac=0.30, device="cpu")
                 _skel_mask = _vht2_bridge.skeleton_mask_128()
                 _skel_size = int(_skel_mask.sum().item())
-                # Pool will be lazily initialized on first miss (need device)
-                print(f"[SP BlockSkip] VHT2 compression enabled: "
-                      f"skeleton={_skel_size}/128 ({_skel_size/128:.0%})")
+                if enable_tier_skeleton:
+                    _skel_mask_granite = _vht2_bridge.skeleton_mask_128(frac=granite_skel_frac)
+                    _skel_mask_sand    = _vht2_bridge.skeleton_mask_128(frac=sand_skel_frac)
+                    _skel_mask_jazz    = _vht2_bridge.skeleton_mask_128(frac=jazz_skel_frac)
+                    print(f"[SP BlockSkip] VHT2 compression enabled (tier-aware): "
+                          f"granite={int(_skel_mask_granite.sum().item())}/128 "
+                          f"sand={int(_skel_mask_sand.sum().item())}/128 "
+                          f"jazz={int(_skel_mask_jazz.sum().item())}/128")
+                else:
+                    print(f"[SP BlockSkip] VHT2 compression enabled: "
+                          f"skeleton={_skel_size}/128 ({_skel_size/128:.0%})")
             except ImportError:
                 print("[SP BlockSkip] WARNING: vht2_cuda_bridge not available, "
                       "falling back to raw caching")
                 _use_vht2 = False
+
+        # Returns the right skeleton mask for a given block index. When the
+        # tier toggle is off, all blocks share the uniform _skel_mask.
+        def _mask_for(i):
+            if not enable_tier_skeleton or _skel_mask_granite is None:
+                return _skel_mask
+            if i < 4:
+                return _skel_mask_granite
+            if i < 9:
+                return _skel_mask_sand
+            return _skel_mask_jazz
         _n_blocks_total = n_blocks  # for partition Z summary
 
         # Shared state across all patched blocks
@@ -1400,6 +1439,11 @@ class ShannonPrimeWanBlockSkip:
                         return t.to(dtype=x.dtype).to(device=x.device)
                     return t.to(device=x.device, dtype=x.dtype)
 
+                # v2 piece 2/7: tier-appropriate skeleton mask for this block
+                _block_skel_mask = _mask_for(block_idx)
+                _block_skel_size = (int(_block_skel_mask.sum().item())
+                                    if _block_skel_mask is not None else 0)
+
                 def _store(t):
                     if _use_vht2 and _vht2_bridge is not None:
                         # VHT2 compress: butterfly → skeleton extract → CPU
@@ -1407,7 +1451,7 @@ class ShannonPrimeWanBlockSkip:
                         try:
                             flat = t.detach().reshape(-1, _head_dim)
                             spectral = _vht2_bridge.forward(flat.float())
-                            compressed = spectral[:, _skel_mask].to(dtype=_blk_dtype).cpu()
+                            compressed = spectral[:, _block_skel_mask].to(dtype=_blk_dtype).cpu()
                             return compressed
                         except Exception:
                             pass  # fall through to raw
@@ -1416,17 +1460,18 @@ class ShannonPrimeWanBlockSkip:
                 def _load_maybe_vht2(t):
                     """Load tensor, decompressing from VHT2 if compressed."""
                     if (_use_vht2 and _vht2_bridge is not None
-                            and t.shape[-1] != _head_dim):
+                            and t.shape[-1] != _head_dim
+                            and t.shape[-1] == _block_skel_size):
                         # Compressed: [N, skeleton_size] → decompress
                         try:
                             full = torch.zeros(t.shape[0], _head_dim,
                                                dtype=torch.float32)
-                            full[:, _skel_mask] = t.float()
+                            full[:, _block_skel_mask] = t.float()
                             # Strange-attractor stack piece 3/4: twin-prime borrow
                             # before the inverse butterfly (decode-only).
                             if enable_twin_borrow:
                                 full = _vht2_bridge.apply_twin_borrow(
-                                    full, _skel_mask,
+                                    full, _block_skel_mask,
                                     alpha=twin_alpha, threshold=twin_threshold)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
@@ -1623,6 +1668,10 @@ class ShannonPrimeWanBlockSkip:
         if enable_harmonic_correction:
             print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f} "
                   f"(linear extrapolation, ~2× cache memory)")
+        if enable_tier_skeleton and _use_vht2:
+            print(f"[SP BlockSkip] Tier-aware skeleton ON: "
+                  f"granite={granite_skel_frac:.0%}, sand={sand_skel_frac:.0%}, "
+                  f"jazz={jazz_skel_frac:.0%}")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
