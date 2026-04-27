@@ -1146,6 +1146,21 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Only borrow when relative |c_i-c_j|/max exceeds this. 0.0=always borrow, 0.1=outliers only."}),
                 "twin_borrow_mode": (["symmetric", "low_anchor", "high_anchor"], {"default": "symmetric",
                     "tooltip": "v2 piece 3: borrow asymmetry. symmetric=both pull to mean. low_anchor=lower-prime fixed, higher pulls toward it. high_anchor=inverse."}),
+                # ── v2 quick win: Goldbach gap extension ─────────────────
+                # Twin primes (gap=2) are one slice of a larger structure.
+                # Cousin primes (gap=4) and sexy primes (gap=6) extend the
+                # arithmetical-neighbor connectivity graph. Larger gap =
+                # weaker neighbor, so α scales as 2/gap automatically.
+                "enable_goldbach_pairs": ("BOOLEAN", {"default": False,
+                    "tooltip": "v2 quick win: extend twin-prime borrow to Goldbach-style gap-4 (cousin) and gap-6 (sexy) prime pairs. α auto-scales (gap-2 = α, gap-4 = α/2, gap-6 = α/3). Only takes effect when enable_twin_borrow=True."}),
+                # ── v2 quick win: distance-to-Zeta-Zero decay scaling ─────
+                # Per-pair α is multiplied by exp(-λ · dist_to_nearest_zeta_zero)
+                # so that pairs straddling a Riemann-zero spectral position
+                # get full borrow strength while pairs between zeros get
+                # reduced strength. Realizes the paper's "Zero-Computation
+                # Resonance" claim. Only effective when twin_borrow is on.
+                "zeta_decay_lambda": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.30, "step": 0.01,
+                    "tooltip": "v2 quick win: Riemann-zero distance decay. 0=disabled (uniform α). 0.05=slow decay (mid-spectrum still borrows ~60%). 0.15=fast decay (only zero-adjacent pairs borrow). Compounds with twin_borrow_mode and goldbach_pairs."}),
                 # ── v2 piece 1/5: harmonic correction on cache hits ──────
                 # Sally as harmonic oscillator near equilibrium: when input
                 # drift is small the trajectory is approximately linear, so a
@@ -1157,6 +1172,14 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "Linearly extrapolate y on cache hit using (y_curr - y_prev) velocity. Costs ~2× BlockSkip cache memory when on."}),
                 "harmonic_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05,
                     "tooltip": "Strength of the linear correction. 0=no correction (identity), 0.5=conservative half-step, 1.0=full extrapolation."}),
+                # ── v2 quick win: tier-adaptive harmonic strength ─────────
+                # Granite has approximately flat Fisher metric — linear
+                # extrapolation is exact, full strength is safe. Jazz has
+                # curved metric — linear extrapolation degrades, scale down.
+                # When ON, per-tier multipliers: granite ×1.0, sand ×0.7,
+                # jazz ×0.4 applied on top of harmonic_strength.
+                "harmonic_tier_scaling": ("BOOLEAN", {"default": False,
+                    "tooltip": "Scale harmonic_strength per tier (granite ×1.0, sand ×0.7, jazz ×0.4). Reflects Fisher curvature — flatter manifold tolerates fuller extrapolation."}),
                 # ── v2 piece 2/7: layer-dependent skeleton fraction ──────
                 # Granite tier sits at cos_sim>0.999 across many steps —
                 # there's room for higher fidelity (more skeleton coefficients
@@ -1191,6 +1214,18 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "When a drift- or curvature-induced miss fires, also invalidate ±cauchy_radius neighbor blocks within the same tier."}),
                 "cauchy_radius": ("INT", {"default": 2, "min": 0, "max": 10,
                     "tooltip": "Block-index radius for the reset. 0=no neighbors, 2=±2 same-tier neighbors, etc."}),
+                # ── v2 quick win: Hamiltonian sentinel ───────────────────
+                # Tracks the conserved-quantity proxy H = T + V where:
+                #   T = ‖x_curr - x_prev‖² / ‖x_prev‖²  (kinetic / input drift)
+                #   V = ‖y_curr - y_prev‖² / ‖y_prev‖²  (potential / output drift)
+                # Conservative dynamics keeps H roughly constant. Big jumps in
+                # H mean the trajectory has gained "energy" — it's leaving the
+                # basin (escape velocity). New gate fires alongside drift and
+                # curvature; tighter than either alone.
+                "enable_hamiltonian_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "v2 quick win: gate cache hits by conservation of H = kinetic_x + potential_y. Catches escapes that drift- and curvature-gates miss."}),
+                "hamiltonian_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Max acceptable relative jump in H between miss steps (|ΔH|/H_prev). 0.30 = energy can grow 30% before forcing a refresh."}),
                 # ── v2 piece 7/7: foveated mask input ────────────────────
                 # Optional MASK that biases the gates toward stricter behavior
                 # when a subject of interest is identified. v1 uses scalar
@@ -1217,11 +1252,14 @@ class ShannonPrimeWanBlockSkip:
               enable_sigma_streak=False,
               enable_twin_borrow=False, twin_alpha=0.10, twin_threshold=0.0,
               twin_borrow_mode="symmetric",
+              enable_goldbach_pairs=False, zeta_decay_lambda=0.0,
               enable_harmonic_correction=False, harmonic_strength=0.5,
+              harmonic_tier_scaling=False,
               enable_tier_skeleton=False,
               granite_skel_frac=0.50, sand_skel_frac=0.30, jazz_skel_frac=0.20,
               enable_curvature_gate=False, curvature_threshold=-0.05,
               enable_cauchy_reset=False, cauchy_radius=2,
+              enable_hamiltonian_gate=False, hamiltonian_threshold=0.30,
               subject_mask=None, subject_focus_strength=0.5,
               verbose=False, **_ignored):
         import types
@@ -1261,6 +1299,9 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _obj.get("prev_attn_cache", {}).clear()
+                            _obj.get("prev_x", {}).clear()
+                            _obj.get("hamiltonian", {}).clear()
+                            _obj.get("hamiltonian_violation", {}).clear()
                             _cleared += 1
                     except ValueError:
                         pass
@@ -1356,6 +1397,11 @@ class ShannonPrimeWanBlockSkip:
             'prev_attn_cache':{},       # block_idx -> previous miss's y (for harmonic correction)
             'delta_sim':      {},       # v2 piece 4: last (rolling - prev_rolling) per block
             'curvature_violation': {},  # v2 piece 4: per-block flag set when accel < threshold
+            # ── v2 quick win: Hamiltonian sentinel state ──────────────
+            'prev_x_norm':    {},       # block_idx -> ‖x_prev‖ at last miss
+            'prev_x':         {},       # block_idx -> x tensor at last miss (CPU fp16)
+            'hamiltonian':    {},       # block_idx -> last computed H
+            'hamiltonian_violation': {},# block_idx -> bool flag for escape-velocity miss
         }
 
         # ── v2 piece 7/7: foveated mask coverage ─────────────────────────
@@ -1414,7 +1460,8 @@ class ShannonPrimeWanBlockSkip:
                     continue
                 for k in ('attn_cache', 'xattn_cache', 'ffn_cache',
                           'prev_attn_cache', 'step_cached', 'hit_streak',
-                          'rolling_sim', 'delta_sim', 'curvature_violation'):
+                          'rolling_sim', 'delta_sim', 'curvature_violation',
+                          'prev_x', 'hamiltonian', 'hamiltonian_violation'):
                     if bi in st.get(k, {}):
                         st[k].pop(bi, None)
                         cleared += 1
@@ -1568,6 +1615,15 @@ class ShannonPrimeWanBlockSkip:
                 else:
                     curvature_ok = True
 
+                # v2 quick win: Hamiltonian sentinel — energy conservation.
+                # If the last miss measured a big jump in H = T + V, the
+                # trajectory has gained kinetic + potential energy and is
+                # at escape velocity. Deny the hit.
+                if enable_hamiltonian_gate:
+                    hamiltonian_ok = not state['hamiltonian_violation'].get(block_idx, False)
+                else:
+                    hamiltonian_ok = True
+
                 # ── CACHE HIT ──────────────────────────────────────────────
                 _streak_limit = _current_streak_limit()
                 # Detect a "would have hit but for the gates" — that's the
@@ -1577,7 +1633,7 @@ class ShannonPrimeWanBlockSkip:
                                     and cached_xa is not None
                                     and age >= 0 and age < window
                                     and streak < _streak_limit
-                                    and not (drift_ok and curvature_ok))
+                                    and not (drift_ok and curvature_ok and hamiltonian_ok))
                 if enable_cauchy_reset and gate_forced_miss and cauchy_radius > 0:
                     n_cleared = _cauchy_reset(block_idx, state)
                     if verbose and n_cleared > 0:
@@ -1589,7 +1645,8 @@ class ShannonPrimeWanBlockSkip:
                        and age >= 0 and age < window
                        and streak < _streak_limit
                        and drift_ok
-                       and curvature_ok)
+                       and curvature_ok
+                       and hamiltonian_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1632,10 +1689,19 @@ class ShannonPrimeWanBlockSkip:
                             # Strange-attractor stack piece 3/4: twin-prime borrow
                             # before the inverse butterfly (decode-only).
                             if enable_twin_borrow:
-                                full = _vht2_bridge.apply_twin_borrow(
-                                    full, _block_skel_mask,
-                                    alpha=twin_alpha, threshold=twin_threshold,
-                                    mode=twin_borrow_mode)
+                                if enable_goldbach_pairs:
+                                    full = _vht2_bridge.apply_goldbach_borrow(
+                                        full, _block_skel_mask,
+                                        alpha=twin_alpha, threshold=twin_threshold,
+                                        mode=twin_borrow_mode,
+                                        gaps=(2, 4, 6),
+                                        zeta_lambda=zeta_decay_lambda)
+                                else:
+                                    full = _vht2_bridge.apply_twin_borrow(
+                                        full, _block_skel_mask,
+                                        alpha=twin_alpha, threshold=twin_threshold,
+                                        mode=twin_borrow_mode,
+                                        zeta_lambda=zeta_decay_lambda)
                             recon = _vht2_bridge.forward(full)  # inverse
                             return recon.to(device=x.device, dtype=x.dtype)
                         except Exception:
@@ -1655,7 +1721,16 @@ class ShannonPrimeWanBlockSkip:
                         if prev_y_storage is not None and window > 0:
                             try:
                                 y_prev = _load_maybe_vht2(prev_y_storage)
-                                scale = (age / float(window)) * harmonic_strength
+                                # v2 quick win: tier-adaptive strength.
+                                # Granite (flat Fisher metric) tolerates full
+                                # extrapolation; jazz (curved) needs scaling
+                                # down. Reflects manifold curvature.
+                                tier_mult = 1.0
+                                if harmonic_tier_scaling:
+                                    if block_idx < 4:    tier_mult = 1.0   # granite
+                                    elif block_idx < 9:  tier_mult = 0.7   # sand
+                                    else:                tier_mult = 0.4   # jazz
+                                scale = (age / float(window)) * harmonic_strength * tier_mult
                                 if scale > 0.0:
                                     y = y + scale * (y - y_prev)
                                 del y_prev
@@ -1710,7 +1785,9 @@ class ShannonPrimeWanBlockSkip:
                     # ~2-step memory: enough to filter single-step blips but
                     # responsive enough to catch a real attractor escape.
                     prev_y = state['attn_cache'].get(block_idx)
-                    if prev_y is not None and (verbose or enable_drift_gate or enable_curvature_gate):
+                    if prev_y is not None and (verbose or enable_drift_gate
+                                                or enable_curvature_gate
+                                                or enable_hamiltonian_gate):
                         prev_on_dev = _load(prev_y)
                         f_sim = _fisher_cos_sim(y, prev_on_dev, _fisher_w)
                         state['fisher_sim'][block_idx] = f_sim
@@ -1725,11 +1802,41 @@ class ShannonPrimeWanBlockSkip:
                                 prev_delta = state['delta_sim'].get(block_idx, 0.0)
                                 accel = curr_delta - prev_delta
                                 state['delta_sim'][block_idx] = curr_delta
-                                # Negative accel below threshold = sim accelerating
-                                # downward = trajectory escaping basin. Set flag
-                                # so next hit decision denies the hit.
                                 state['curvature_violation'][block_idx] = (
                                     accel < curvature_threshold)
+
+                        # v2 quick win: Hamiltonian sentinel.
+                        # T = relative drift of input x; V = relative drift
+                        # of output y. H = T + V. Conservative dynamics →
+                        # H roughly constant. Big jumps signal escape.
+                        if enable_hamiltonian_gate:
+                            try:
+                                # Output drift V (already on-device)
+                                y_prev_dev = prev_on_dev
+                                v_term = float((y - y_prev_dev).pow(2).mean().item() /
+                                               max(y_prev_dev.pow(2).mean().item(), 1e-12))
+                                # Input drift T (compare against stored prev_x)
+                                stored_x = state['prev_x'].get(block_idx)
+                                if stored_x is not None:
+                                    x_prev_dev = stored_x.to(device=x.device, dtype=x.dtype)
+                                    t_term = float((x - x_prev_dev).pow(2).mean().item() /
+                                                   max(x_prev_dev.pow(2).mean().item(), 1e-12))
+                                    del x_prev_dev
+                                else:
+                                    t_term = 0.0
+                                H_curr = t_term + v_term
+                                H_prev = state['hamiltonian'].get(block_idx, H_curr)
+                                # Relative jump in H. First step has H_prev==H_curr → 0.
+                                rel_jump = (abs(H_curr - H_prev) /
+                                            max(abs(H_prev), 1e-6))
+                                state['hamiltonian'][block_idx] = H_curr
+                                state['hamiltonian_violation'][block_idx] = (
+                                    rel_jump > hamiltonian_threshold)
+                                # Store current x (CPU fp16) for next miss step
+                                state['prev_x'][block_idx] = (
+                                    x.detach().to(dtype=torch.float16).cpu())
+                            except Exception:
+                                pass  # fail safe — gate stays clear
                         del prev_on_dev
 
                     # v2 piece 1/5: capture prev y before overwriting,
@@ -1836,14 +1943,16 @@ class ShannonPrimeWanBlockSkip:
                   f"across sigma range (sigma source: {src})")
         if enable_twin_borrow:
             if _use_vht2:
+                gold_str = " + Goldbach (gap 2/4/6)" if enable_goldbach_pairs else ""
                 print(f"[SP BlockSkip] Twin-prime borrow ON: α={twin_alpha:.2f} "
-                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode} "
-                      f"(decode-only, 9 disjoint pairs)")
+                      f"threshold={twin_threshold:.2f} mode={twin_borrow_mode}"
+                      f"{gold_str} (decode-only)")
             else:
                 print(f"[SP BlockSkip] Twin-prime borrow requested but cache_compress=raw — no-op")
         if enable_harmonic_correction:
-            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f} "
-                  f"(linear extrapolation, ~2× cache memory)")
+            tier_str = " (tier-scaled: G×1.0/S×0.7/J×0.4)" if harmonic_tier_scaling else ""
+            print(f"[SP BlockSkip] Harmonic correction ON: strength={harmonic_strength:.2f}"
+                  f"{tier_str} (linear extrapolation, ~2× cache memory)")
         if enable_tier_skeleton and _use_vht2:
             print(f"[SP BlockSkip] Tier-aware skeleton ON: "
                   f"granite={granite_skel_frac:.0%}, sand={sand_skel_frac:.0%}, "
@@ -1854,6 +1963,11 @@ class ShannonPrimeWanBlockSkip:
         if enable_cauchy_reset:
             print(f"[SP BlockSkip] Cauchy reset ON: radius={cauchy_radius} "
                   f"(invalidate ±{cauchy_radius} same-tier neighbors on gated miss)")
+        if enable_hamiltonian_gate:
+            print(f"[SP BlockSkip] Hamiltonian gate ON: threshold={hamiltonian_threshold:.2f} "
+                  f"(force miss when |ΔH|/H > threshold; H = T_x + V_y)")
+        if zeta_decay_lambda > 0.0 and enable_twin_borrow:
+            print(f"[SP BlockSkip] Zeta-decay borrow scaling ON: λ={zeta_decay_lambda:.3f}")
         if subject_mask is not None and _subject_coverage > 0.0:
             print(f"[SP BlockSkip] Subject mask: coverage={_subject_coverage:.1%} "
                   f"strength={subject_focus_strength:.2f} → "
@@ -1935,6 +2049,9 @@ class ShannonPrimeWanCacheFlush:
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
                         obj.get("prev_attn_cache", {}).clear()
+                        obj.get("prev_x", {}).clear()
+                        obj.get("hamiltonian", {}).clear()
+                        obj.get("hamiltonian_violation", {}).clear()
                         if n > 0:
                             flushed_blockskip += 1
 
