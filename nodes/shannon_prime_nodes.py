@@ -1896,13 +1896,23 @@ class ShannonPrimeWanCacheFlush:
                 "model":   ("MODEL",),
                 "samples": ("LATENT",),
             },
+            "optional": {
+                # v2 ergonomic: when ON, also evict the loaded model from VRAM
+                # (equivalent to ComfyUI's /free endpoint with unload_models=True
+                # and free_memory=True). Default OFF preserves prior behavior:
+                # ComfyUI keeps the model resident between runs to avoid reload
+                # cost. Turn ON if you want VRAM back after each generation
+                # (useful for switching workflows or running other GPU tasks).
+                "auto_free_after_run": ("BOOLEAN", {"default": False,
+                    "tooltip": "After flushing caches, also unload the loaded model from VRAM and run a full memory free. Equivalent to hitting ComfyUI's /free endpoint. OFF = ComfyUI keeps model resident between runs (default, fastest re-runs). ON = ~9 GB freed but next run pays reload cost."}),
+            },
         }
 
     @classmethod
     def IS_CHANGED(cls, *a, **k):
         return float("nan")
 
-    def flush(self, model, samples):
+    def flush(self, model, samples, auto_free_after_run=False, **_ignored):
         flushed_blockskip = 0
         flushed_crossattn = 0
 
@@ -1949,6 +1959,27 @@ class ShannonPrimeWanCacheFlush:
                   f"{flushed_crossattn} cross-attn caches + torch.cuda.empty_cache()")
         else:
             print("[SP CacheFlush] no caches found (node still safe to use)")
+
+        # v2 ergonomic: also unload the model from VRAM if requested.
+        # Uses comfy.model_management directly so we don't depend on the API
+        # being reachable from inside the node.
+        if auto_free_after_run:
+            try:
+                import comfy.model_management as mm
+                mm.unload_all_models()
+                mm.soft_empty_cache()
+                # Best-effort second pass — empty_cache is idempotent and cheap
+                try:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                print("[SP CacheFlush] auto_free_after_run: models unloaded, "
+                      "VRAM released")
+            except Exception as e:
+                print(f"[SP CacheFlush] auto_free_after_run failed: {e}")
 
         return (samples,)
 

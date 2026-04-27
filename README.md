@@ -349,6 +349,38 @@ The bench tool auto-validates workflows by converting graph format to API format
 
 ---
 
+## Strange-Attractor Stack (v1 + v2)
+
+The `feat/strange-attractor-stack` and `feat/strange-attractor-stack-v2` branches add a sandbox of arithmetically-grounded toggles on top of the v1 ship. **All default OFF**; existing workflows are bit-identical without explicit opt-in. Toggle them on through the `ShannonPrimeWanBlockSkip` node.
+
+The theoretical framework is documented in [*The Music of the Spheres: A Strange Attraction*](../music_of_the_spheres.md). Empirical results: ~1.7× additional speedup over the prior 4.6× ship at unchanged or improved visual quality on RTX 2060.
+
+| Toggle | What it does | When to try it |
+|---|---|---|
+| `enable_drift_gate` + `granite_threshold` / `sand_threshold` / `jazz_threshold` | Gates cache hits by rolling Fisher cosine similarity per tier. Forces a refresh when the trajectory escapes its basin. | Composition flicker on long streaks |
+| `enable_sigma_streak` | Streak limits scale with normalized sigma. Granite 7-15, sand 4-9, jazz 3-6 across the schedule. | Long sigma schedules or SVI |
+| `enable_twin_borrow` + `twin_alpha` + `twin_threshold` + `twin_borrow_mode` | Smooths VHT2 spectral coefficients along twin-prime pairs (3-5, 11-13, 17-19, …). Modes: symmetric, low_anchor, high_anchor. Decode-only, only takes effect with `cache_compress=vht2`. | Texture noise / detail crispness |
+| `enable_harmonic_correction` + `harmonic_strength` | Linear forward-Euler extrapolation along the cache-trajectory velocity on hits. α=0.5 conservative, 0.9 aggressive. | Subject motion that wants longer streaks |
+| `enable_tier_skeleton` + `granite_skel_frac` / `sand_skel_frac` / `jazz_skel_frac` | Per-tier VHT2 skeleton fractions. Defaults 50% / 30% / 20%. Higher granite = denser composition foundation; higher jazz = more texture detail. | "Cardboard cut-out" feel — bump granite to 0.65-0.75 and jazz to 0.30 |
+| `enable_curvature_gate` + `curvature_threshold` | Forces miss when rolling cos_sim acceleration drops below threshold. Catches basin escape *before* the static drift gate would. | Sudden quality jumps mid-generation |
+| `enable_cauchy_reset` + `cauchy_radius` | When a gate fires on block N, also invalidates ±radius same-tier neighbors so they refresh together. | Cascading flicker across a tier |
+| `subject_mask` (MASK input) + `subject_focus_strength` | Tightens drift thresholds proportional to mask coverage. Foveated bias toward the subject region. v1 = scalar; per-token version is a future build. | Subject quality more important than background |
+| `lattice_alpha` (on `ShannonPrimeWanCache`) | Factored 3D lattice RoPE — temporal axis gets long-tier prime-harmonic frequencies, spatial gets local-tier. 0.17 paper default. Recently revived for the new ComfyUI EmbedND API. | Long-form video, scene-cut coherence |
+
+### Auto-free VRAM after run
+
+`ShannonPrimeWanCacheFlush` accepts `auto_free_after_run` (default OFF). Turn ON to fully unload the model from VRAM and free memory after each generation. Useful when switching workflows or running other GPU tasks between runs. Default OFF preserves ComfyUI's standard behavior of keeping models resident for fast re-runs.
+
+### Recommended starting points
+
+**Conservative quality**: drift gate + sigma-streak ON, everything else OFF. Adds ~zero cost, prevents most long-streak flicker.
+
+**Standard v2**: above + harmonic_correction (α=0.5) + tier_skeleton (granite=0.50, sand=0.30, jazz=0.20) + twin_borrow (symmetric, α=0.10). The "balanced" preset.
+
+**Aggressive v2**: above + curvature_gate + cauchy_reset (radius=2). Maximum sentinel coverage; minor extra cost.
+
+**Maximum stack** ("chef's kiss"): all v2 toggles ON, harmonic_strength=0.7, granite_skel_frac=0.65 to combat cardboard-cutout, lattice RoPE α=0.17 ON via `ShannonPrimeWanCache`. Tested clean on Wan 2.2 14B / 5B and Wan 2.1 30-block.
+
 ## Tuning Guide
 
 **Start conservative, then open up.** The defaults are safe for any model and prompt.
