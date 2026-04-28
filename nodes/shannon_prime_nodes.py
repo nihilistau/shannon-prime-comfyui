@@ -1251,6 +1251,42 @@ class ShannonPrimeWanBlockSkip:
                     "tooltip": "v3 foveated: scale harmonic_strength per token by the subject_mask. Subject tokens get full extrapolation; background tokens get reduced. Only effective with enable_harmonic_correction=True AND subject_mask provided."}),
                 "background_harmonic_floor": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Minimum α multiplier for background tokens (mask~0). 0=no extrapolation in background, 0.2=20% strength, 1.0=ignore mask."}),
+                # ── v4: higher-order geodesic integration (Verlet / AB2) ─
+                # Forward-Euler is order 1. Adams-Bashforth-2 uses two
+                # previous velocities for an order-2 extrapolation that's
+                # exact for quadratic trajectories — reflects Christoffel-
+                # corrected parallel transport when the manifold is curved.
+                # Storage: 3× cache memory (curr + prev + prev_prev y).
+                "harmonic_order": (["1_euler", "2_ab2"], {"default": "1_euler",
+                    "tooltip": "v4: harmonic correction integrator order. 1_euler = forward-Euler (1× extra cache), 2_ab2 = Adams-Bashforth 2-step (2× extra cache, exact for quadratic trajectories on curved metrics)."}),
+                # ── v4: Gauss-flux per-head energy conservation gate ─────
+                # Track per-head L2 energy of attention output. If one head
+                # dominates (dispersion grows by N sigma), the block is
+                # generating "internal heat" — hallucination noise. Force
+                # a refresh. Different signal than cos_sim drift.
+                "enable_gauss_flux_gate": ("BOOLEAN", {"default": False,
+                    "tooltip": "v4: gate cache hits by per-head energy dispersion. Catches 'internal heat' (one head dominating) that cos_sim doesn't see."}),
+                "flux_threshold_sigmas": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 8.0, "step": 0.5,
+                    "tooltip": "Number of standard deviations a single head's energy can exceed the mean before triggering. 3.0 = strict, 5.0 = lenient."}),
+                # ── v4: temporal Cauchy reset (scene-cut detector) ───────
+                # Beyond the within-tier block-index Cauchy reset, also
+                # detect a "scene cut" via input-drift sentinel: when the
+                # mean magnitude of x jumps by more than scene_cut_threshold
+                # between steps, invalidate ALL block caches. Reflects the
+                # paper's "expanding shell of news" — accelerated charge
+                # radiates a wavefront that re-anchors the temporal cache.
+                "enable_temporal_cauchy": ("BOOLEAN", {"default": False,
+                    "tooltip": "v4: detect scene cuts via input-drift jumps; on detection invalidate all block caches at once."}),
+                "scene_cut_threshold": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 1.00, "step": 0.05,
+                    "tooltip": "Relative input-magnitude jump that counts as a scene cut. 0.30 = 30% increase between steps fires the reset."}),
+                # ── v4: decaying bit-memory (arithmetical friction) ──────
+                # The metaphor's "trampoline manifold" — recent bits have
+                # full bounce, older bits decay back into Granite. Layered
+                # on top of harmonic correction: scale by exp(-rate*age)
+                # so older cached values contribute less. Default rate=0
+                # disables (existing linear-window behavior).
+                "bit_decay_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.30, "step": 0.01,
+                    "tooltip": "v4: exponential decay applied to harmonic-correction strength as a function of cache age. 0=disabled, 0.10 = e-fold every ~10 steps."}),
                 "verbose": ("BOOLEAN", {"default": False,
                     "tooltip": "Print per-block HIT/MISS logs + Fisher cos_sim + Partition Z proxy"}),
             },
@@ -1279,6 +1315,10 @@ class ShannonPrimeWanBlockSkip:
               enable_hamiltonian_gate=False, hamiltonian_threshold=0.30,
               subject_mask=None, subject_focus_strength=0.5,
               enable_per_token_harmonic=False, background_harmonic_floor=0.20,
+              harmonic_order="1_euler",
+              enable_gauss_flux_gate=False, flux_threshold_sigmas=3.0,
+              enable_temporal_cauchy=False, scene_cut_threshold=0.30,
+              bit_decay_rate=0.0,
               verbose=False, **_ignored):
         import types
         import comfy.model_management
@@ -1317,9 +1357,11 @@ class ShannonPrimeWanBlockSkip:
                             _obj.get("step_cached", {}).clear()
                             _obj.get("hit_streak", {}).clear()
                             _obj.get("prev_attn_cache", {}).clear()
+                            _obj.get("prev_prev_attn_cache", {}).clear()
                             _obj.get("prev_x", {}).clear()
                             _obj.get("hamiltonian", {}).clear()
                             _obj.get("hamiltonian_violation", {}).clear()
+                            _obj.get("gauss_violation", {}).clear()
                             _cleared += 1
                     except ValueError:
                         pass
@@ -1420,6 +1462,11 @@ class ShannonPrimeWanBlockSkip:
             'prev_x':         {},       # block_idx -> x tensor at last miss (CPU fp16)
             'hamiltonian':    {},       # block_idx -> last computed H
             'hamiltonian_violation': {},# block_idx -> bool flag for escape-velocity miss
+            # ── v4 quick wins state ──────────────────────────────────────
+            'prev_prev_attn_cache': {}, # v4: t-2 y for AB2 integrator
+            'gauss_violation':      {}, # v4: per-block flag from flux gate
+            'temporal_x_norm':      [None],  # last step's mean ‖x‖ for scene cuts
+            'scene_cut_flag':       [False], # v4: set by sentinel, read on next step
         }
 
         # ── v2 piece 7/7: foveated mask coverage ─────────────────────────
@@ -1510,9 +1557,11 @@ class ShannonPrimeWanBlockSkip:
                 if bi == triggering:
                     continue
                 for k in ('attn_cache', 'xattn_cache', 'ffn_cache',
-                          'prev_attn_cache', 'step_cached', 'hit_streak',
+                          'prev_attn_cache', 'prev_prev_attn_cache',
+                          'step_cached', 'hit_streak',
                           'rolling_sim', 'delta_sim', 'curvature_violation',
-                          'prev_x', 'hamiltonian', 'hamiltonian_violation'):
+                          'prev_x', 'hamiltonian', 'hamiltonian_violation',
+                          'gauss_violation'):
                     if bi in st.get(k, {}):
                         st[k].pop(bi, None)
                         cleared += 1
@@ -1601,6 +1650,28 @@ class ShannonPrimeWanBlockSkip:
                     state['global_step'][0] += 1
                 step = state['global_step'][0]
 
+                # v4: temporal Cauchy / scene-cut detector. Block-0 only,
+                # at the start of each step. Compares mean ‖x‖ to prev
+                # step's; sets scene_cut_flag if relative jump exceeds
+                # threshold. The flag is read by all blocks this step,
+                # cleared at the start of next step on block-0.
+                if enable_temporal_cauchy and block_idx == 0:
+                    try:
+                        curr_x_norm = float(x.float().pow(2).mean().sqrt().item())
+                        prev_x_norm = state['temporal_x_norm'][0]
+                        # Always clear the previous-step flag at start of new step
+                        state['scene_cut_flag'][0] = False
+                        if prev_x_norm is not None and prev_x_norm > 1e-6:
+                            rel_jump = abs(curr_x_norm - prev_x_norm) / prev_x_norm
+                            if rel_jump > scene_cut_threshold:
+                                state['scene_cut_flag'][0] = True
+                                if verbose:
+                                    print(f"[SP BlockSkip] TEMPORAL CAUCHY (scene cut) "
+                                          f"step={step} jump={rel_jump:.2%} > {scene_cut_threshold:.2%}")
+                        state['temporal_x_norm'][0] = curr_x_norm
+                    except Exception:
+                        pass
+
                 # Generation boundary: handled by patch() clearing at prompt
                 # start. NO runtime detection — SVI distilled schedules have
                 # non-monotonic sigma, so e_mag increase != new generation.
@@ -1667,13 +1738,22 @@ class ShannonPrimeWanBlockSkip:
                     curvature_ok = True
 
                 # v2 quick win: Hamiltonian sentinel — energy conservation.
-                # If the last miss measured a big jump in H = T + V, the
-                # trajectory has gained kinetic + potential energy and is
-                # at escape velocity. Deny the hit.
                 if enable_hamiltonian_gate:
                     hamiltonian_ok = not state['hamiltonian_violation'].get(block_idx, False)
                 else:
                     hamiltonian_ok = True
+
+                # v4: Gauss-flux gate — per-head energy dispersion.
+                if enable_gauss_flux_gate:
+                    flux_ok = not state['gauss_violation'].get(block_idx, False)
+                else:
+                    flux_ok = True
+
+                # v4: temporal Cauchy (scene cut). Set on block-0 by sentinel,
+                # consumed by all blocks for one step. Self-clearing after use.
+                temporal_ok = True
+                if enable_temporal_cauchy and state['scene_cut_flag'][0]:
+                    temporal_ok = False
 
                 # ── CACHE HIT ──────────────────────────────────────────────
                 _streak_limit = _current_streak_limit()
@@ -1684,7 +1764,8 @@ class ShannonPrimeWanBlockSkip:
                                     and cached_xa is not None
                                     and age >= 0 and age < window
                                     and streak < _streak_limit
-                                    and not (drift_ok and curvature_ok and hamiltonian_ok))
+                                    and not (drift_ok and curvature_ok and hamiltonian_ok
+                                             and flux_ok and temporal_ok))
                 if enable_cauchy_reset and gate_forced_miss and cauchy_radius > 0:
                     n_cleared = _cauchy_reset(block_idx, state)
                     if verbose and n_cleared > 0:
@@ -1697,7 +1778,9 @@ class ShannonPrimeWanBlockSkip:
                        and streak < _streak_limit
                        and drift_ok
                        and curvature_ok
-                       and hamiltonian_ok)
+                       and hamiltonian_ok
+                       and flux_ok
+                       and temporal_ok)
 
                 # ── Helpers: store/load with per-block dtype ──��───────────
                 _blk_dtype = _dtype_for(block_idx)
@@ -1773,24 +1856,38 @@ class ShannonPrimeWanBlockSkip:
                             try:
                                 y_prev = _load_maybe_vht2(prev_y_storage)
                                 # v2 quick win: tier-adaptive strength.
-                                # Granite (flat Fisher metric) tolerates full
-                                # extrapolation; jazz (curved) needs scaling
-                                # down. Reflects manifold curvature.
                                 tier_mult = 1.0
                                 if harmonic_tier_scaling:
                                     if block_idx < 4:    tier_mult = 1.0   # granite
                                     elif block_idx < 9:  tier_mult = 0.7   # sand
                                     else:                tier_mult = 0.4   # jazz
-                                scale = (age / float(window)) * harmonic_strength * tier_mult
+
+                                # v4: optional bit-decay (exp falloff with age)
+                                base_t = age / float(window)
+                                if bit_decay_rate > 0.0:
+                                    base_t = base_t * math.exp(-bit_decay_rate * age)
+                                scale = base_t * harmonic_strength * tier_mult
+
+                                # v4: AB2 integrator — needs t-2 cache.
+                                # Fall back to Euler if not yet populated.
+                                velocity = y - y_prev
+                                if harmonic_order == "2_ab2":
+                                    pp_storage = state['prev_prev_attn_cache'].get(block_idx)
+                                    if pp_storage is not None:
+                                        try:
+                                            y_pp = _load_maybe_vht2(pp_storage)
+                                            velocity = 1.5 * (y - y_prev) - 0.5 * (y_prev - y_pp)
+                                            del y_pp
+                                        except Exception:
+                                            pass
+
                                 if scale > 0.0:
                                     # v3: per-token foveated scaling.
-                                    # y shape: [B, S, hidden]; weight shape: [S]
-                                    # Broadcast as [1, S, 1] over the sequence axis.
                                     pt_w = _per_token_weight(y.shape[1], y.device, y.dtype)
                                     if pt_w is not None:
-                                        y = y + scale * pt_w.view(1, -1, 1) * (y - y_prev)
+                                        y = y + scale * pt_w.view(1, -1, 1) * velocity
                                     else:
-                                        y = y + scale * (y - y_prev)
+                                        y = y + scale * velocity
                                 del y_prev
                             except Exception:
                                 pass  # fail safe — use unmodified y
@@ -1863,6 +1960,29 @@ class ShannonPrimeWanBlockSkip:
                                 state['curvature_violation'][block_idx] = (
                                     accel < curvature_threshold)
 
+                        # v4: Gauss-flux per-head energy gate.
+                        # Reshape y from [B, S, num_heads*head_dim] to
+                        # [B, S, num_heads, head_dim], compute per-head L2
+                        # energy summed over (B, S, head_dim). If dispersion
+                        # in head energies (z-score of max) exceeds threshold,
+                        # flag the block as generating "internal heat".
+                        if enable_gauss_flux_gate:
+                            try:
+                                hd = _head_dim
+                                if y.shape[-1] % hd == 0 and y.shape[-1] >= hd * 2:
+                                    nh = y.shape[-1] // hd
+                                    yh = y.float().reshape(*y.shape[:-1], nh, hd)
+                                    # per-head energy (single scalar per head)
+                                    energies = yh.pow(2).mean(dim=tuple(range(yh.ndim - 2)) + (-1,))
+                                    # energies shape: [num_heads]
+                                    e_mean = energies.mean()
+                                    e_std = energies.std().clamp(min=1e-12)
+                                    z_max = float(((energies.max() - e_mean) / e_std).item())
+                                    state['gauss_violation'][block_idx] = (
+                                        z_max > flux_threshold_sigmas)
+                            except Exception:
+                                pass
+
                         # v2 quick win: Hamiltonian sentinel.
                         # T = relative drift of input x; V = relative drift
                         # of output y. H = T + V. Conservative dynamics →
@@ -1899,7 +2019,12 @@ class ShannonPrimeWanBlockSkip:
 
                     # v2 piece 1/5: capture prev y before overwriting,
                     # for harmonic correction on subsequent hits.
+                    # v4: rotate the t-1 → t-2 chain too when AB2 is on.
                     if enable_harmonic_correction:
+                        if harmonic_order == "2_ab2":
+                            pp_prev = state['prev_attn_cache'].get(block_idx)
+                            if pp_prev is not None:
+                                state['prev_prev_attn_cache'][block_idx] = pp_prev
                         prev_storage = state['attn_cache'].get(block_idx)
                         if prev_storage is not None:
                             state['prev_attn_cache'][block_idx] = prev_storage
@@ -2033,6 +2158,16 @@ class ShannonPrimeWanBlockSkip:
         if enable_per_token_harmonic and _mask_flat_cpu is not None:
             print(f"[SP BlockSkip] v3 per-token harmonic ON: floor={background_harmonic_floor:.2f} "
                   f"(subject tokens: full α; background tokens: α × {background_harmonic_floor:.2f})")
+        if harmonic_order == "2_ab2" and enable_harmonic_correction:
+            print(f"[SP BlockSkip] v4 harmonic order: AB2 (Adams-Bashforth 2-step, 3× cache memory)")
+        if enable_gauss_flux_gate:
+            print(f"[SP BlockSkip] v4 Gauss-flux gate ON: σ-threshold={flux_threshold_sigmas:.1f} "
+                  f"(per-head energy dispersion)")
+        if enable_temporal_cauchy:
+            print(f"[SP BlockSkip] v4 temporal Cauchy ON: scene-cut threshold={scene_cut_threshold:.2%}")
+        if bit_decay_rate > 0.0:
+            print(f"[SP BlockSkip] v4 bit-decay ON: rate={bit_decay_rate:.3f} "
+                  f"(exp falloff on harmonic strength with cache age)")
         if verbose:
             print(f"[SP BlockSkip] Verbose: Fisher cos_sim + Partition Z proxy logging enabled")
 
@@ -2110,9 +2245,11 @@ class ShannonPrimeWanCacheFlush:
                         obj.get("step_cached", {}).clear()
                         obj.get("hit_streak", {}).clear()
                         obj.get("prev_attn_cache", {}).clear()
+                        obj.get("prev_prev_attn_cache", {}).clear()
                         obj.get("prev_x", {}).clear()
                         obj.get("hamiltonian", {}).clear()
                         obj.get("hamiltonian_violation", {}).clear()
+                        obj.get("gauss_violation", {}).clear()
                         if n > 0:
                             flushed_blockskip += 1
 
